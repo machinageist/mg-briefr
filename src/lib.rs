@@ -1,3 +1,5 @@
+pub mod cve;
+
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use feed_rs::parser;
