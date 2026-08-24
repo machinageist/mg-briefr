@@ -6,6 +6,7 @@ use reqwest::redirect::Policy;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
@@ -17,6 +18,7 @@ use std::{
 use url::Url;
 
 pub const JSON_VERSION: &str = "mg-brief/v1";
+pub const INTEROP_SCHEMA: &str = "mg.interop/1";
 const MAX_REDIRECTS: usize = 5;
 const DEFAULT_USER_AGENT: &str = "mg-brief/0.1 (+local research client)";
 // A recently-started run may belong to another active process. Only runs
@@ -69,6 +71,42 @@ pub struct Artifact {
     pub bytes: u64,
     pub path: String,
     pub media_type: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InteropSnapshot {
+    pub interop_schema: &'static str,
+    pub kind: &'static str,
+    pub producer: InteropProducer,
+    pub export_id: String,
+    pub created_at: String,
+    pub source_revision: String,
+    pub records: Vec<InteropRecord>,
+    pub links: Vec<serde_json::Value>,
+    pub provenance: Vec<InteropRecord>,
+    pub diagnostics: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InteropProducer {
+    pub app: &'static str,
+    pub app_version: &'static str,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InteropOrigin {
+    pub app: &'static str,
+    pub kind: String,
+    pub local_id: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InteropRecord {
+    pub global_id: String,
+    pub origin: InteropOrigin,
+    pub revision: i64,
+    pub observed_at: String,
+    pub payload: serde_json::Value,
 }
 
 impl Store {
@@ -176,6 +214,199 @@ impl Store {
             .query_map([], source_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Export a deterministic, read-only interoperability snapshot.
+    pub fn export_interop_snapshot(&self) -> Result<InteropSnapshot> {
+        let c = self.conn()?;
+        let mut records = Vec::new();
+        let mut links = Vec::new();
+        let mut provenance = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut created_at = String::new();
+
+        let mut st = c.prepare("SELECT id,name,url,enabled,created_at FROM sources ORDER BY id")?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get::<_, String>(4)?,
+            ))
+        })? {
+            let (id, name, url, enabled, observed_at) = row?;
+            created_at = created_at.max(observed_at.clone());
+            records.push(interop_record("source", id.to_string(), observed_at, json!({
+                "name": name, "url": redact_url(&url), "user_agent": "<redacted>", "enabled": enabled
+            })));
+        }
+
+        let mut st = c.prepare("SELECT id,source_id,started_at,finished_at,status,http_status,final_url,error FROM fetch_runs ORDER BY id")?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })? {
+            let (id, source_id, started, finished, status, http_status, final_url, error) = row?;
+            created_at = created_at.max(finished.clone().unwrap_or_else(|| started.clone()));
+            if let Some(error) = error.as_deref() {
+                diagnostics.push(
+                    json!({"code": "fetch", "fetch_run_id": id, "message": safe_diagnostic(error)}),
+                );
+            }
+            records.push(interop_record("fetch_run", id.to_string(), started.clone(), json!({
+                "source_global_id": format!("mg-brief:source:{source_id}"), "started_at": started,
+                "finished_at": finished, "status": status, "http_status": http_status,
+                "final_url": final_url.map(|u| redact_url(&u)), "error": error.map(|e| safe_diagnostic(&e))
+            })));
+            links.push(interop_link(
+                "source->fetch_run",
+                format!("mg-brief:source:{source_id}"),
+                format!("mg-brief:fetch_run:{id}"),
+            ));
+        }
+
+        let mut st = c.prepare("SELECT id,sha256,byte_len,relative_path,media_type,created_at FROM artifacts ORDER BY sha256")?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })? {
+            let (id, sha, bytes, path, media_type, observed_at) = row?;
+            created_at = created_at.max(observed_at.clone());
+            records.push(interop_record("artifact", id.to_string(), observed_at, json!({
+                "sha256": sha, "bytes": bytes, "path": safe_relative_path(&path)?, "media_type": media_type
+            })));
+        }
+
+        let mut st = c.prepare("SELECT id,source_id,identity_key,guid,url,title,published_at,first_seen_at FROM feed_items ORDER BY source_id,identity_key")?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })? {
+            let (id, source_id, identity, guid, url, title, published_at, observed_at) = row?;
+            created_at = created_at.max(observed_at.clone());
+            let global_id = format!("mg-brief:feed_item:{id}");
+            records.push(interop_record_with_id(global_id, "feed_item", id.to_string(), observed_at, json!({
+                "source_global_id": format!("mg-brief:source:{source_id}"), "identity_key": identity,
+                "guid": guid, "url": url.map(|u| redact_url(&u)), "title": title,
+                "published_at": published_at
+            })));
+        }
+
+        let mut st = c.prepare("SELECT id,fetch_run_id,artifact_id,item_id,source_url,fetched_at FROM provenance ORDER BY id")?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })? {
+            let (id, run_id, artifact_id, item_id, source_url, observed_at) = row?;
+            created_at = created_at.max(observed_at.clone());
+            provenance.push(interop_record(
+                "provenance",
+                id.to_string(),
+                observed_at,
+                json!({
+                    "fetch_run_global_id": format!("mg-brief:fetch_run:{run_id}"),
+                    "artifact_global_id": format!("mg-brief:artifact:{artifact_id}"),
+                    "item_global_id": item_id.map(|v| format!("mg-brief:feed_item:{v}")),
+                    "source_url": redact_url(&source_url)
+                }),
+            ));
+            links.push(interop_link(
+                "fetch_run->artifact",
+                format!("mg-brief:fetch_run:{run_id}"),
+                format!("mg-brief:artifact:{artifact_id}"),
+            ));
+            if let Some(item_id) = item_id {
+                links.push(interop_link(
+                    "fetch_run->feed_item",
+                    format!("mg-brief:fetch_run:{run_id}"),
+                    format!("mg-brief:feed_item:{item_id}"),
+                ));
+                let source_id: i64 = c.query_row(
+                    "SELECT source_id FROM feed_items WHERE id=?1",
+                    params![item_id],
+                    |r| r.get(0),
+                )?;
+                links.push(interop_link(
+                    "source->feed_item",
+                    format!("mg-brief:source:{source_id}"),
+                    format!("mg-brief:feed_item:{item_id}"),
+                ));
+            }
+            links.push(interop_link(
+                "provenance->fetch_run",
+                format!("mg-brief:provenance:{id}"),
+                format!("mg-brief:fetch_run:{run_id}"),
+            ));
+            links.push(interop_link(
+                "provenance->artifact",
+                format!("mg-brief:provenance:{id}"),
+                format!("mg-brief:artifact:{artifact_id}"),
+            ));
+        }
+        links.sort_by(|a, b| {
+            (a["type"].as_str(), a["from"].as_str(), a["to"].as_str()).cmp(&(
+                b["type"].as_str(),
+                b["from"].as_str(),
+                b["to"].as_str(),
+            ))
+        });
+        links.dedup();
+        let created_at = if created_at.is_empty() {
+            "1970-01-01T00:00:00Z".into()
+        } else {
+            created_at
+        };
+        let mut snapshot = InteropSnapshot {
+            interop_schema: INTEROP_SCHEMA,
+            kind: "snapshot",
+            producer: InteropProducer {
+                app: "mg-brief",
+                app_version: env!("CARGO_PKG_VERSION"),
+            },
+            export_id: String::new(),
+            created_at,
+            source_revision: String::new(),
+            records,
+            links,
+            provenance,
+            diagnostics,
+        };
+        // Identity covers the complete exported payload, except the two identity
+        // fields themselves. This explicit input avoids circular hashing while
+        // ensuring provenance, diagnostics, and links cannot be changed silently.
+        let revision = interop_revision(&snapshot)?;
+        snapshot.export_id = format!("mg-brief:export:{revision}");
+        snapshot.source_revision = revision;
+        Ok(snapshot)
     }
 
     pub fn fetch(&self, name: &str, max_bytes: u64, timeout_secs: u64) -> Result<FetchResult> {
@@ -321,6 +552,79 @@ impl Store {
             result
         })();
         result
+    }
+}
+
+fn interop_link(kind: &str, from: String, to: String) -> serde_json::Value {
+    json!({"type": kind, "from": from, "to": to})
+}
+
+fn interop_revision(snapshot: &InteropSnapshot) -> Result<String> {
+    let canonical = serde_json::to_vec(&json!({
+        "interop_schema": snapshot.interop_schema,
+        "kind": snapshot.kind,
+        "producer": &snapshot.producer,
+        "created_at": &snapshot.created_at,
+        "records": &snapshot.records,
+        "links": &snapshot.links,
+        "provenance": &snapshot.provenance,
+        "diagnostics": &snapshot.diagnostics,
+    }))?;
+    Ok(hex(&Sha256::digest(canonical)))
+}
+
+fn interop_record(
+    kind: &str,
+    local_id: String,
+    observed_at: String,
+    payload: serde_json::Value,
+) -> InteropRecord {
+    interop_record_with_id(
+        format!("mg-brief:{kind}:{local_id}"),
+        kind,
+        local_id,
+        observed_at,
+        payload,
+    )
+}
+
+fn interop_record_with_id(
+    global_id: String,
+    kind: &str,
+    local_id: String,
+    observed_at: String,
+    payload: serde_json::Value,
+) -> InteropRecord {
+    InteropRecord {
+        global_id,
+        origin: InteropOrigin {
+            app: "mg-brief",
+            kind: kind.into(),
+            local_id,
+        },
+        revision: 1,
+        observed_at,
+        payload,
+    }
+}
+
+fn safe_relative_path(path: &str) -> Result<String> {
+    let p = Path::new(path);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!("artifact path is not exportable")
+    }
+    Ok(path.to_owned())
+}
+
+fn safe_diagnostic(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("secret") || lower.contains("token") || lower.contains("password") {
+        "operation failed".into()
+    } else {
+        message.replace(['\n', '\r'], " ")
     }
 }
 
@@ -859,6 +1163,8 @@ fn redact_url(raw: &str) -> String {
         .map(|mut u| {
             let _ = u.set_password(None);
             let _ = u.set_username("");
+            u.set_query(None);
+            u.set_fragment(None);
             u.to_string()
         })
         .unwrap_or_else(|_| "<invalid-url>".into())
@@ -908,6 +1214,16 @@ mod tests {
         );
         let b = s.fetch("test", 1024, 1)?;
         assert_eq!(ar.sha256, b.artifact.unwrap().sha256);
+        let snapshot = s.export_interop_snapshot()?;
+        let link_types: Vec<&str> = snapshot
+            .links
+            .iter()
+            .filter_map(|link| link["type"].as_str())
+            .collect();
+        assert!(link_types.contains(&"source->fetch_run"));
+        assert!(link_types.contains(&"fetch_run->artifact"));
+        assert!(link_types.contains(&"fetch_run->feed_item"));
+        assert!(link_types.contains(&"source->feed_item"));
         Ok(())
     }
 
@@ -1049,6 +1365,66 @@ mod tests {
             "770e607624d689265ca6c44884d0807d9b054d23c2b6f8f70a1e54f7e5e6f3a2"
         )
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn interop_empty_snapshot_is_stable() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let store = Store::open(d.path().join("db.sqlite"), d.path().join("artifacts"))?;
+        let first = serde_json::to_string(&store.export_interop_snapshot()?)?;
+        let second = serde_json::to_string(&store.export_interop_snapshot()?)?;
+        assert_eq!(first, second);
+        let snapshot = store.export_interop_snapshot()?;
+        assert_eq!(snapshot.interop_schema, "mg.interop/1");
+        assert_eq!(snapshot.kind, "snapshot");
+        assert!(snapshot.records.is_empty());
+        assert!(snapshot.provenance.is_empty());
+        let mut changed = snapshot.clone();
+        changed.links.push(interop_link(
+            "source->fetch_run",
+            "mg-brief:source:1".into(),
+            "mg-brief:fetch_run:1".into(),
+        ));
+        assert_ne!(snapshot.source_revision, interop_revision(&changed)?);
+        let mut changed = snapshot.clone();
+        changed.provenance.push(interop_record(
+            "provenance",
+            "1".into(),
+            "1970-01-01T00:00:00Z".into(),
+            json!({"source_url": "https://example.test"}),
+        ));
+        assert_ne!(snapshot.source_revision, interop_revision(&changed)?);
+        let mut changed = snapshot.clone();
+        changed.diagnostics.push(json!({"code": "test"}));
+        assert_ne!(snapshot.source_revision, interop_revision(&changed)?);
+        Ok(())
+    }
+
+    #[test]
+    fn interop_catalog_contains_identities_and_redacts_sensitive_fields() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let store = Store::open(d.path().join("db.sqlite"), d.path().join("artifacts"))?;
+        store.register(
+            "private",
+            "https://example.test/feed?token=abc",
+            Some("Agent secret"),
+        )?;
+        let snapshot = store.export_interop_snapshot()?;
+        let encoded = serde_json::to_string(&snapshot)?;
+        assert!(encoded.contains("mg-brief:source:1"));
+        assert!(encoded.contains("<redacted>"));
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("token=abc"));
+        assert!(!encoded.contains(&store.db_path.to_string_lossy().to_string()));
+        assert!(!encoded.contains(&store.artifact_root.to_string_lossy().to_string()));
+        let source = snapshot
+            .records
+            .iter()
+            .find(|r| r.origin.kind == "source")
+            .unwrap();
+        assert_eq!(source.origin.local_id, "1");
+        assert_eq!(source.revision, 1);
         Ok(())
     }
 }

@@ -34,6 +34,10 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         timeout_seconds: u64,
     },
+    Export {
+        #[arg(long)]
+        json: bool,
+    },
 }
 fn defaults() -> (PathBuf, PathBuf) {
     let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -69,6 +73,12 @@ fn main() -> Result<()> {
             "{}",
             to_string_pretty(&store.fetch(&name, max_bytes, timeout_seconds)?)?
         ),
+        Command::Export { json } => {
+            if !json {
+                anyhow::bail!("export requires --json")
+            }
+            println!("{}", to_string_pretty(&store.export_interop_snapshot()?)?)
+        }
     }
     Ok(())
 }
