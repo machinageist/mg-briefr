@@ -2,12 +2,13 @@ pub mod cve;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
+use cve::{CveRecord, CveVersion, SourceReference, StableId, StorageLocator};
 use feed_rs::parser;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::ser::{SerializeStruct, Serializer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -73,6 +74,45 @@ pub struct Artifact {
     pub bytes: u64,
     pub path: String,
     pub media_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CveArtifactInput {
+    pub source_id: StableId,
+    pub locator: String,
+    pub path: PathBuf,
+    pub media_type: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CveIngestResult {
+    pub schema: &'static str,
+    pub cve_id: String,
+    pub version_id: String,
+    pub revision: String,
+    pub inserted: bool,
+    pub current: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CveCurrent {
+    pub schema: &'static str,
+    pub record: CveRecord,
+    pub version: CveVersion,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CveHistoryPage {
+    pub schema: &'static str,
+    pub cve_id: String,
+    pub items: Vec<CveHistoryItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CveHistoryItem {
+    pub record: CveRecord,
+    pub version: CveVersion,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -216,6 +256,433 @@ impl Store {
             .query_map([], source_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Transactionally ingest one immutable CVE revision and its authoritative artifacts.
+    ///
+    /// Current-state ordering is the lexicographic tuple `(modified_at, revision, version_id)`.
+    /// Older revisions remain in history but never replace a newer current revision. Reusing a
+    /// version ID or `(CVE, revision)` for different content is a hard conflict.
+    pub fn ingest_cve(
+        &self,
+        record: &CveRecord,
+        version: &CveVersion,
+        artifacts: &[CveArtifactInput],
+    ) -> Result<CveIngestResult> {
+        self.ingest_cve_with_before_commit(record, version, artifacts, |_| Ok(()))
+    }
+
+    fn ingest_cve_with_before_commit<F>(
+        &self,
+        record: &CveRecord,
+        version: &CveVersion,
+        artifacts: &[CveArtifactInput],
+        before_commit: F,
+    ) -> Result<CveIngestResult>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    {
+        record.validate().context("invalid CVE record")?;
+        version.validate().context("invalid CVE version")?;
+        if record.id != version.cve_id {
+            bail!("CVE record and version identity differ")
+        }
+        if record.modified_at != version.modified_at {
+            bail!("CVE record and version modification times differ")
+        }
+        let record_json = cve::cve_record_storage_json(record)?;
+        let version_json = cve::cve_version_storage_json(version)?;
+        let references = cve_references(record, version)?;
+        let prepared = artifacts
+            .iter()
+            .map(prepare_cve_artifact)
+            .collect::<Result<Vec<_>>>()?;
+        for artifact in &prepared {
+            if !references.iter().any(|reference| {
+                reference.source_id.as_str() == artifact.source_id
+                    && reference.locator == artifact.locator
+                    && reference.content_sha256.as_deref() == Some(artifact.sha256.as_str())
+            }) {
+                bail!("CVE artifact is not claimed by provenance")
+            }
+        }
+
+        let mut c = self.conn()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut installed_paths = Vec::new();
+        let outcome = (|| -> Result<CveIngestResult> {
+            for artifact in &prepared {
+                let relative_path = format!("sha256/{}/{}", &artifact.sha256[..2], artifact.sha256);
+                let path = self.artifact_root.join(&relative_path);
+                if atomic_write_verified(&path, &artifact.bytes, &artifact.sha256)? {
+                    installed_paths.push(path);
+                }
+                tx.execute(
+                    "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(sha256) DO NOTHING",
+                    params![artifact.sha256, artifact.bytes.len() as i64, relative_path, artifact.media_type, record.provenance.observed_at.to_rfc3339()],
+                )?;
+                let artifact_id: i64 = tx
+                    .query_row(
+                        "SELECT id FROM artifacts WHERE sha256=?1 AND byte_len=?2 AND relative_path=?3",
+                        params![artifact.sha256, artifact.bytes.len() as i64, relative_path],
+                        |row| row.get(0),
+                    )
+                    .context("artifact catalog conflict")?;
+                tx.execute(
+                    "INSERT INTO artifact_owners(source_id,artifact_id,locator) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
+                    params![artifact.source_id, artifact_id, artifact.locator],
+                )?;
+            }
+            for reference in &references {
+                verify_cve_artifact(&tx, &self.artifact_root, reference)?;
+            }
+
+            let existing = tx
+                .query_row(
+                    "SELECT record_json,version_json FROM cve_versions WHERE id=?1",
+                    params![version.id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_record, existing_version)) = existing {
+                if existing_record != record_json || existing_version != version_json {
+                    bail!("immutable CVE version conflict")
+                }
+                let current = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cve_current WHERE cve_id=?1 AND version_id=?2)",
+                    params![record.id.as_str(), version.id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                return Ok(CveIngestResult {
+                    schema: JSON_VERSION,
+                    cve_id: record.id.as_str().to_owned(),
+                    version_id: version.id.as_str().to_owned(),
+                    revision: version.revision.clone(),
+                    inserted: false,
+                    current,
+                });
+            }
+            if tx
+                .query_row(
+                    "SELECT id FROM cve_versions WHERE cve_id=?1 AND revision=?2",
+                    params![record.id.as_str(), version.revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some()
+            {
+                bail!("immutable CVE revision conflict")
+            }
+            tx.execute(
+                "INSERT INTO cve_versions(id,cve_id,revision,modified_at,record_json,version_json,observed_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![version.id.as_str(), record.id.as_str(), version.revision, version.modified_at.to_rfc3339(), record_json, version_json, record.provenance.observed_at.to_rfc3339()],
+            )?;
+            for (ordinal, reference) in references.iter().enumerate() {
+                let artifact_id: i64 = tx.query_row(
+                    "SELECT a.id FROM artifacts a JOIN artifact_owners o ON o.artifact_id=a.id WHERE o.source_id=?1 AND o.locator=?2 AND a.sha256=?3",
+                    params![reference.source_id.as_str(), reference.locator, reference.content_sha256.as_deref()],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO cve_version_provenance(version_id,ordinal,source_id,artifact_id,locator,retrieved_at,source_version) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![version.id.as_str(), ordinal as i64, reference.source_id.as_str(), artifact_id, reference.locator, reference.retrieved_at.to_rfc3339(), reference.source_version],
+                )?;
+            }
+            let current_key = tx
+                .query_row(
+                    "SELECT v.modified_at,v.revision,v.id FROM cve_current c JOIN cve_versions v ON v.id=c.version_id WHERE c.cve_id=?1",
+                    params![record.id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .optional()?;
+            let incoming_key = (
+                version.modified_at.to_rfc3339(),
+                version.revision.as_str(),
+                version.id.as_str(),
+            );
+            let make_current = current_key.as_ref().is_none_or(|(modified, revision, id)| {
+                incoming_key > (modified.clone(), revision.as_str(), id.as_str())
+            });
+            if make_current {
+                tx.execute(
+                    "INSERT INTO cve_current(cve_id,version_id) VALUES (?1,?2) ON CONFLICT(cve_id) DO UPDATE SET version_id=excluded.version_id",
+                    params![record.id.as_str(), version.id.as_str()],
+                )?;
+            }
+            Ok(CveIngestResult {
+                schema: JSON_VERSION,
+                cve_id: record.id.as_str().to_owned(),
+                version_id: version.id.as_str().to_owned(),
+                revision: version.revision.clone(),
+                inserted: true,
+                current: make_current,
+            })
+        })();
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                cleanup_installed_cve_artifacts(&installed_paths, &error)?;
+                return Err(error);
+            }
+        };
+        let commit = before_commit(&tx).and_then(|()| tx.commit().map_err(Into::into));
+        let Err(error) = commit else {
+            return Ok(result);
+        };
+
+        // A failed COMMIT is not proof of rollback. The transaction has been
+        // consumed (and rusqlite has attempted rollback on drop), so inspect
+        // the catalog under a fresh write guard before touching files.
+        let probe = CveCommitProbe {
+            record,
+            version,
+            references: &references,
+            record_json: &record_json,
+            version_json: &version_json,
+            installed_paths: &installed_paths,
+        };
+        match self.reconcile_cve_commit(probe, &error) {
+            Ok(CveCommitState::Complete { current }) => Ok(CveIngestResult {
+                current,
+                ..result
+            }),
+            Ok(CveCommitState::Absent) => Err(error),
+            Ok(CveCommitState::Indeterminate) => Err(error.context(
+                "CVE commit outcome is indeterminate; retained newly installed artifacts",
+            )),
+            Err(probe_error) => Err(error.context(format!(
+                "CVE commit outcome could not be verified; retained newly installed artifacts: {probe_error:#}"
+            ))),
+        }
+    }
+
+    fn reconcile_cve_commit(
+        &self,
+        probe: CveCommitProbe<'_>,
+        commit_error: &anyhow::Error,
+    ) -> Result<CveCommitState> {
+        self.reconcile_cve_commit_with_absent_guard(probe, commit_error, || Ok(()))
+    }
+
+    fn reconcile_cve_commit_with_absent_guard<F>(
+        &self,
+        probe: CveCommitProbe<'_>,
+        commit_error: &anyhow::Error,
+        before_absent_cleanup: F,
+    ) -> Result<CveCommitState>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let CveCommitProbe {
+            record,
+            version,
+            references,
+            record_json,
+            version_json,
+            installed_paths,
+        } = probe;
+        let mut c = self.conn().context("open post-commit catalog probe")?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("guard post-commit catalog probe")?;
+        let stored = tx
+            .query_row(
+                "SELECT cve_id,revision,modified_at,record_json,version_json,observed_at FROM cve_versions WHERE id=?1",
+                params![version.id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some(stored) = stored {
+            let expected = (
+                record.id.as_str(),
+                version.revision.as_str(),
+                version.modified_at.to_rfc3339(),
+                record_json,
+                version_json,
+                record.provenance.observed_at.to_rfc3339(),
+            );
+            if (
+                stored.0.as_str(),
+                stored.1.as_str(),
+                stored.2,
+                stored.3.as_str(),
+                stored.4.as_str(),
+                stored.5,
+            ) != expected
+            {
+                return Ok(CveCommitState::Indeterminate);
+            }
+
+            let mut statement = tx.prepare(
+                "SELECT p.ordinal,p.source_id,p.locator,p.retrieved_at,p.source_version,a.sha256,a.byte_len,a.relative_path,EXISTS(SELECT 1 FROM artifact_owners o WHERE o.source_id=p.source_id AND o.artifact_id=p.artifact_id AND o.locator=p.locator) FROM cve_version_provenance p JOIN artifacts a ON a.id=p.artifact_id WHERE p.version_id=?1 ORDER BY p.ordinal",
+            )?;
+            let rows = statement
+                .query_map(params![version.id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, bool>(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if rows.len() != references.len() {
+                return Ok(CveCommitState::Indeterminate);
+            }
+            for (ordinal, (row, reference)) in rows.iter().zip(references).enumerate() {
+                let expected_hash = reference.content_sha256.as_deref().unwrap_or_default();
+                let expected_path = format!("sha256/{}/{expected_hash}", &expected_hash[..2]);
+                if row.0 != ordinal as i64
+                    || row.1 != reference.source_id.as_str()
+                    || row.2 != reference.locator
+                    || row.3 != reference.retrieved_at.to_rfc3339()
+                    || row.4 != reference.source_version
+                    || row.5 != expected_hash
+                    || row.6 < 0
+                    || row.7 != expected_path
+                    || !row.8
+                {
+                    return Ok(CveCommitState::Indeterminate);
+                }
+                let path = self.artifact_root.join(&row.7);
+                let bytes = read_trusted_file(&self.artifact_root, &path, row.6 as u64 + 1)?;
+                if bytes.len() as i64 != row.6 || hex(&Sha256::digest(&bytes)) != expected_hash {
+                    return Ok(CveCommitState::Indeterminate);
+                }
+            }
+            let current = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cve_current WHERE cve_id=?1 AND version_id=?2)",
+                params![record.id.as_str(), version.id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            return Ok(CveCommitState::Complete { current });
+        }
+
+        let conflicting_version: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cve_versions WHERE cve_id=?1 AND revision=?2)",
+            params![record.id.as_str(), version.revision],
+            |row| row.get(0),
+        )?;
+        let dependent_rows: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cve_current WHERE version_id=?1) OR EXISTS(SELECT 1 FROM cve_version_provenance WHERE version_id=?1)",
+            params![version.id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut installed_cataloged = false;
+        for path in installed_paths {
+            let relative = path
+                .strip_prefix(&self.artifact_root)
+                .context("installed artifact escaped artifact root")?
+                .to_string_lossy();
+            installed_cataloged |= tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE relative_path=?1)",
+                params![relative.as_ref()],
+                |row| row.get::<_, bool>(0),
+            )?;
+        }
+        let state =
+            decide_cve_commit_state(conflicting_version, dependent_rows, installed_cataloged);
+        if state == CveCommitState::Absent {
+            before_absent_cleanup()?;
+            cleanup_installed_cve_artifacts(installed_paths, commit_error)?;
+            drop(tx);
+        }
+        Ok(state)
+    }
+
+    pub fn current_cve(&self, cve_id: &str) -> Result<CveCurrent> {
+        cve::validate_cve_identifier(cve_id)?;
+        let c = self.conn()?;
+        let (record_json, version_json) = c
+            .query_row(
+                "SELECT v.record_json,v.version_json FROM cve_current current JOIN cve_versions v ON v.id=current.version_id WHERE current.cve_id=?1",
+                params![cve_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .context("CVE not found")?;
+        Ok(CveCurrent {
+            schema: JSON_VERSION,
+            record: serde_json::from_str(&record_json).context("invalid stored CVE record")?,
+            version: serde_json::from_str(&version_json).context("invalid stored CVE version")?,
+        })
+    }
+
+    pub fn cve_history(
+        &self,
+        cve_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<CveHistoryPage> {
+        cve::validate_cve_identifier(cve_id)?;
+        if !(1..=100).contains(&limit) {
+            bail!("history limit must be between 1 and 100")
+        }
+        let cursor = cursor.map(decode_history_cursor).transpose()?;
+        let c = self.conn()?;
+        let mut statement = c.prepare(
+            "SELECT id,modified_at,record_json,version_json FROM cve_versions WHERE cve_id=?1 AND (?2 IS NULL OR modified_at < ?2 OR (modified_at = ?2 AND id < ?3)) ORDER BY modified_at DESC,id DESC LIMIT ?4",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    cve_id,
+                    cursor.as_ref().map(|value| value.modified_at.as_str()),
+                    cursor.as_ref().map(|value| value.id.as_str()),
+                    (limit + 1) as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = rows.len() > limit;
+        let selected = rows.into_iter().take(limit).collect::<Vec<_>>();
+        let next_cursor = if has_more {
+            selected
+                .last()
+                .map(|(id, modified_at, _, _)| encode_history_cursor(modified_at, id))
+                .transpose()?
+        } else {
+            None
+        };
+        let items = selected
+            .into_iter()
+            .map(|(_, _, record_json, version_json)| {
+                Ok(CveHistoryItem {
+                    record: serde_json::from_str(&record_json)
+                        .context("invalid stored CVE record")?,
+                    version: serde_json::from_str(&version_json)
+                        .context("invalid stored CVE version")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CveHistoryPage {
+            schema: JSON_VERSION,
+            cve_id: cve_id.to_owned(),
+            items,
+            next_cursor,
+        })
     }
 
     /// Export a deterministic, read-only interoperability snapshot.
@@ -374,6 +841,125 @@ impl Store {
                 format!("mg-brief:artifact:{artifact_id}"),
             ));
         }
+        let mut statement = c.prepare(
+            "SELECT current.cve_id,current.version_id,v.record_json,v.observed_at FROM cve_current current JOIN cve_versions v ON v.id=current.version_id ORDER BY current.cve_id",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })? {
+            let (cve_id, version_id, record_json, observed_at) = row?;
+            let record: CveRecord =
+                serde_json::from_str(&record_json).context("invalid stored CVE record")?;
+            created_at = created_at.max(observed_at.clone());
+            records.push(interop_record_with_id(
+                format!("mg-brief:cve_record:{cve_id}"),
+                "cve_record",
+                cve_id.clone(),
+                observed_at.clone(),
+                serde_json::to_value(&record)?,
+            ));
+            links.push(interop_link(
+                "cve_record->current_revision",
+                format!("mg-brief:cve_record:{cve_id}"),
+                format!("mg-brief:cve_revision:{version_id}"),
+            ));
+            diagnostics.push(json!({
+                "code": "cve_freshness",
+                "cve_id": cve_id,
+                "status": "not_evaluated",
+                "last_observed_at": observed_at
+            }));
+        }
+
+        let mut statement = c.prepare(
+            "SELECT id,cve_id,record_json,version_json,observed_at FROM cve_versions ORDER BY cve_id,modified_at,id",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })? {
+            let (version_id, cve_id, record_json, version_json, observed_at) = row?;
+            let record: CveRecord =
+                serde_json::from_str(&record_json).context("invalid stored CVE record")?;
+            let version: CveVersion =
+                serde_json::from_str(&version_json).context("invalid stored CVE version")?;
+            records.push(interop_record_with_id(
+                format!("mg-brief:cve_revision:{version_id}"),
+                "cve_revision",
+                version_id.clone(),
+                observed_at,
+                json!({"record": record, "version": version}),
+            ));
+            links.push(interop_link(
+                "cve_record->revision",
+                format!("mg-brief:cve_record:{cve_id}"),
+                format!("mg-brief:cve_revision:{version_id}"),
+            ));
+        }
+
+        let mut statement = c.prepare(
+            "SELECT p.version_id,p.ordinal,p.source_id,p.locator,p.retrieved_at,p.source_version,a.id,a.sha256 FROM cve_version_provenance p JOIN artifacts a ON a.id=p.artifact_id ORDER BY p.version_id,p.ordinal",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })? {
+            let (
+                version_id,
+                ordinal,
+                source_id,
+                locator,
+                retrieved_at,
+                source_version,
+                artifact_id,
+                sha256,
+            ) = row?;
+            let reference = SourceReference {
+                source_id: StableId::new(source_id)?,
+                locator,
+                content_sha256: Some(sha256),
+                retrieved_at: chrono::DateTime::parse_from_rfc3339(&retrieved_at)?
+                    .with_timezone(&Utc),
+                source_version,
+            };
+            let provenance_id = format!("{version_id}:{ordinal}");
+            provenance.push(interop_record_with_id(
+                format!("mg-brief:cve_provenance:{provenance_id}"),
+                "cve_provenance",
+                provenance_id.clone(),
+                retrieved_at,
+                serde_json::to_value(&reference)?,
+            ));
+            links.push(interop_link(
+                "cve_revision->provenance",
+                format!("mg-brief:cve_revision:{version_id}"),
+                format!("mg-brief:cve_provenance:{provenance_id}"),
+            ));
+            links.push(interop_link(
+                "cve_provenance->artifact",
+                format!("mg-brief:cve_provenance:{provenance_id}"),
+                format!("mg-brief:artifact:{artifact_id}"),
+            ));
+        }
+
         links.sort_by(|a, b| {
             (a["type"].as_str(), a["from"].as_str(), a["to"].as_str()).cmp(&(
                 b["type"].as_str(),
@@ -557,6 +1143,151 @@ impl Store {
     }
 }
 
+#[derive(Debug)]
+struct PreparedCveArtifact {
+    source_id: String,
+    locator: String,
+    media_type: String,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+fn prepare_cve_artifact(input: &CveArtifactInput) -> Result<PreparedCveArtifact> {
+    let locator = StorageLocator::new(&input.locator)?;
+    if input.media_type.is_empty()
+        || input.media_type.len() > 256
+        || input.media_type.chars().any(char::is_control)
+    {
+        bail!("invalid CVE artifact media type")
+    }
+    let metadata = fs::symlink_metadata(&input.path).context("inspect CVE artifact")?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("CVE artifact must be a regular non-symlink file")
+    }
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&input.path)
+            .context("open CVE artifact")?
+    };
+    #[cfg(not(unix))]
+    let mut file = File::open(&input.path).context("open CVE artifact")?;
+    if !file.metadata()?.is_file() {
+        bail!("CVE artifact must be a regular file")
+    }
+    let bytes = read_bounded(&mut file, 64 * 1024 * 1024)?;
+    let sha256 = hex(&Sha256::digest(&bytes));
+    Ok(PreparedCveArtifact {
+        source_id: input.source_id.as_str().to_owned(),
+        locator: locator.as_str().to_owned(),
+        media_type: input.media_type.clone(),
+        bytes,
+        sha256,
+    })
+}
+
+fn cve_references(record: &CveRecord, version: &CveVersion) -> Result<Vec<SourceReference>> {
+    let mut references = record
+        .provenance
+        .references
+        .iter()
+        .chain(&version.provenance.references)
+        .cloned()
+        .collect::<Vec<_>>();
+    for reference in &references {
+        StorageLocator::new(&reference.locator)?;
+        if reference.content_sha256.is_none() {
+            bail!("CVE provenance requires an artifact digest")
+        }
+    }
+    references.sort_by(|left, right| {
+        (
+            left.source_id.as_str(),
+            left.locator.as_str(),
+            left.content_sha256.as_deref(),
+            left.retrieved_at,
+            left.source_version.as_deref(),
+        )
+            .cmp(&(
+                right.source_id.as_str(),
+                right.locator.as_str(),
+                right.content_sha256.as_deref(),
+                right.retrieved_at,
+                right.source_version.as_deref(),
+            ))
+    });
+    references.dedup();
+    Ok(references)
+}
+
+fn verify_cve_artifact(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    reference: &SourceReference,
+) -> Result<()> {
+    let expected = reference
+        .content_sha256
+        .as_deref()
+        .context("CVE provenance requires an artifact digest")?;
+    let (relative_path, expected_len): (String, i64) = tx
+        .query_row(
+            "SELECT a.relative_path,a.byte_len FROM artifacts a JOIN artifact_owners o ON o.artifact_id=a.id WHERE o.source_id=?1 AND o.locator=?2 AND a.sha256=?3",
+            params![reference.source_id.as_str(), reference.locator, expected],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .context("CVE provenance artifact is not owned by this source")?;
+    if expected_len < 0 {
+        bail!("invalid artifact catalog length")
+    }
+    let path = root.join(safe_relative_path(&relative_path)?);
+    let bytes = read_trusted_file(root, &path, expected_len as u64 + 1)?;
+    if bytes.len() as i64 != expected_len || hex(&Sha256::digest(&bytes)) != expected {
+        bail!("CVE provenance artifact integrity check failed")
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HistoryCursor {
+    modified_at: String,
+    id: String,
+}
+
+fn encode_history_cursor(modified_at: &str, id: &str) -> Result<String> {
+    Ok(hex(&serde_json::to_vec(&HistoryCursor {
+        modified_at: modified_at.to_owned(),
+        id: id.to_owned(),
+    })?))
+}
+
+fn decode_history_cursor(cursor: &str) -> Result<HistoryCursor> {
+    if cursor.is_empty()
+        || !cursor.len().is_multiple_of(2)
+        || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("malformed history cursor")
+    }
+    let bytes = cursor
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let value = std::str::from_utf8(pair).context("malformed history cursor")?;
+            u8::from_str_radix(value, 16).context("malformed history cursor")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let decoded: HistoryCursor =
+        serde_json::from_slice(&bytes).context("malformed history cursor")?;
+    chrono::DateTime::parse_from_rfc3339(&decoded.modified_at)
+        .context("malformed history cursor")?;
+    StableId::new(decoded.id.clone()).context("malformed history cursor")?;
+    Ok(decoded)
+}
+
 fn interop_link(kind: &str, from: String, to: String) -> serde_json::Value {
     json!({"type": kind, "from": from, "to": to})
 }
@@ -641,7 +1372,7 @@ fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
 }
 
 fn migrate(c: &mut Connection) -> Result<()> {
-    const LATEST: i64 = 2;
+    const LATEST: i64 = 3;
     // Keep ledger discovery and every migration in one write transaction. In
     // particular, do not inspect the ledger before acquiring SQLite's write
     // lock: two first-time opens could otherwise both observe an empty ledger
@@ -667,6 +1398,7 @@ fn migrate(c: &mut Connection) -> Result<()> {
         match next {
             1 => tx.execute_batch("CREATE TABLE sources (id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,url TEXT NOT NULL UNIQUE,user_agent TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL); CREATE TABLE fetch_runs (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),started_at TEXT NOT NULL,finished_at TEXT,status TEXT NOT NULL,http_status INTEGER,final_url TEXT,error TEXT); CREATE TABLE artifacts (id INTEGER PRIMARY KEY,sha256 TEXT NOT NULL UNIQUE,byte_len INTEGER NOT NULL,relative_path TEXT NOT NULL UNIQUE,media_type TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE feed_items (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),identity_key TEXT NOT NULL,guid TEXT,url TEXT,title TEXT NOT NULL,published_at TEXT,first_seen_at TEXT NOT NULL,UNIQUE(source_id,identity_key)); CREATE TABLE provenance (id INTEGER PRIMARY KEY,fetch_run_id INTEGER NOT NULL REFERENCES fetch_runs(id),artifact_id INTEGER NOT NULL REFERENCES artifacts(id),item_id INTEGER REFERENCES feed_items(id),source_url TEXT NOT NULL,fetched_at TEXT NOT NULL);")?,
             2 => tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);")?,
+            3 => tx.execute_batch("CREATE TABLE artifact_owners (source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id TEXT PRIMARY KEY,cve_id TEXT NOT NULL,revision TEXT NOT NULL,modified_at TEXT NOT NULL,record_json TEXT NOT NULL,version_json TEXT NOT NULL,observed_at TEXT NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id TEXT PRIMARY KEY,version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id TEXT NOT NULL REFERENCES cve_versions(id),ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,retrieved_at TEXT NOT NULL,source_version TEXT,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);")?,
             _ => unreachable!(),
         }
         tx.execute(
@@ -831,6 +1563,9 @@ fn read_trusted_file(root: &Path, path: &Path, max: u64) -> Result<Vec<u8>> {
         } else {
             let fd = openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())?;
             let mut file = File::from(fd);
+            if !file.metadata()?.is_file() {
+                bail!("file source must name a regular file")
+            }
             return read_bounded(&mut file, max);
         }
     }
@@ -883,6 +1618,53 @@ fn read_bounded(r: &mut impl Read, max: u64) -> Result<Vec<u8>> {
         bail!("source exceeds configured maximum")
     }
     Ok(b)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CveCommitState {
+    Complete { current: bool },
+    Absent,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy)]
+struct CveCommitProbe<'a> {
+    record: &'a CveRecord,
+    version: &'a CveVersion,
+    references: &'a [SourceReference],
+    record_json: &'a str,
+    version_json: &'a str,
+    installed_paths: &'a [PathBuf],
+}
+
+fn decide_cve_commit_state(
+    conflicting_version: bool,
+    dependent_rows: bool,
+    installed_cataloged: bool,
+) -> CveCommitState {
+    if conflicting_version || dependent_rows || installed_cataloged {
+        CveCommitState::Indeterminate
+    } else {
+        CveCommitState::Absent
+    }
+}
+
+fn cleanup_installed_cve_artifacts(paths: &[PathBuf], error: &anyhow::Error) -> Result<()> {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => {
+                return Err(cleanup_error).with_context(|| {
+                    format!(
+                        "clean up CVE artifact after ingest failure: {} ({error:#})",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1190,8 +1972,60 @@ use std::io::Write;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cve::{Confidence, Provenance};
+    use chrono::{DateTime, TimeZone};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::Write;
+
+    fn cve_fixture(
+        artifact_path: &Path,
+        seconds: i64,
+        revision: &str,
+        version_id: &str,
+        source_id: &str,
+        locator: &str,
+    ) -> (CveRecord, CveVersion, CveArtifactInput) {
+        let modified_at = Utc.timestamp_opt(1_704_067_200 + seconds, 0).unwrap();
+        let sha256 = hex(&Sha256::digest(fs::read(artifact_path).unwrap()));
+        let reference = SourceReference {
+            source_id: StableId::new(source_id).unwrap(),
+            locator: locator.into(),
+            content_sha256: Some(sha256),
+            retrieved_at: modified_at,
+            source_version: Some(revision.into()),
+        };
+        let provenance = Provenance {
+            references: vec![reference],
+            confidence: Confidence::Exact,
+            observed_at: modified_at,
+        };
+        let record = CveRecord {
+            id: StableId::new("CVE-2024-1234").unwrap(),
+            aliases: vec![],
+            descriptions: BTreeMap::from([("en".into(), format!("revision {revision}"))]),
+            cna: Some("example".into()),
+            published_at: Some(DateTime::UNIX_EPOCH),
+            modified_at,
+            withdrawn_at: None,
+            provenance: provenance.clone(),
+        };
+        let version = CveVersion {
+            id: StableId::new(version_id).unwrap(),
+            cve_id: record.id.clone(),
+            revision: revision.into(),
+            modified_at,
+            fields: BTreeMap::from([("state".into(), json!("published"))]),
+            provenance,
+        };
+        let artifact = CveArtifactInput {
+            source_id: StableId::new(source_id).unwrap(),
+            locator: locator.into(),
+            path: artifact_path.to_owned(),
+            media_type: "application/json".into(),
+        };
+        (record, version, artifact)
+    }
     #[test]
     fn file_fetch_is_immutable_and_provenant() -> Result<()> {
         let d = tempfile::tempdir()?;
@@ -1301,7 +2135,7 @@ mod tests {
             .prepare("SELECT version FROM schema_migrations ORDER BY version")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
         Ok(())
     }
 
@@ -1427,6 +2261,537 @@ mod tests {
             .unwrap();
         assert_eq!(source.origin.local_id, "1");
         assert_eq!(source.revision, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cve_ingest_is_immutable_ordered_paginated_and_exported() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let artifact_path = directory.path().join("raw.json");
+        fs::write(&artifact_path, br#"{"source":"nvd"}"#)?;
+        let store = Store::open(
+            directory.path().join("db.sqlite"),
+            directory.path().join("artifacts"),
+        )?;
+        let baseline = store.export_interop_snapshot()?;
+        let (new_record, new_version, artifact) = cve_fixture(
+            &artifact_path,
+            20,
+            "2",
+            "CVE-2024-1234:nvd:2",
+            "nvd",
+            "/private/nvd/raw.json",
+        );
+        let first = store.ingest_cve(&new_record, &new_version, std::slice::from_ref(&artifact))?;
+        assert!(first.inserted);
+        assert!(first.current);
+        let replay = store.ingest_cve(&new_record, &new_version, &[])?;
+        assert!(!replay.inserted);
+        assert!(replay.current);
+
+        let (old_record, old_version, _) = cve_fixture(
+            &artifact_path,
+            10,
+            "1",
+            "CVE-2024-1234:nvd:1",
+            "nvd",
+            "/private/nvd/raw.json",
+        );
+        let old = store.ingest_cve(&old_record, &old_version, &[])?;
+        assert!(old.inserted);
+        assert!(!old.current);
+        assert_eq!(store.current_cve("CVE-2024-1234")?.version.revision, "2");
+
+        let page_one = store.cve_history("CVE-2024-1234", 1, None)?;
+        assert_eq!(page_one.items.len(), 1);
+        assert_eq!(page_one.items[0].version.revision, "2");
+        assert_eq!(page_one.items[0].record.descriptions["en"], "revision 2");
+        let page_two = store.cve_history("CVE-2024-1234", 1, page_one.next_cursor.as_deref())?;
+        assert_eq!(page_two.items.len(), 1);
+        assert_eq!(page_two.items[0].version.revision, "1");
+        assert_eq!(page_two.items[0].record.descriptions["en"], "revision 1");
+        assert!(page_two.next_cursor.is_none());
+        assert!(store.cve_history("CVE-2024-1234", 1, Some("nope")).is_err());
+
+        let first_export = store.export_interop_snapshot()?;
+        let second_export = store.export_interop_snapshot()?;
+        assert_ne!(baseline.source_revision, first_export.source_revision);
+        assert_ne!(baseline.export_id, first_export.export_id);
+        assert_eq!(
+            serde_json::to_vec(&first_export)?,
+            serde_json::to_vec(&second_export)?
+        );
+        let encoded = serde_json::to_string(&first_export)?;
+        assert!(encoded.contains("cve_record"));
+        assert!(encoded.contains("cve_revision"));
+        assert!(encoded.contains("cve_freshness"));
+        let historical_descriptions = first_export
+            .records
+            .iter()
+            .filter(|record| record.origin.kind == "cve_revision")
+            .map(|record| {
+                record.payload["record"]["descriptions"]["en"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(historical_descriptions, vec!["revision 1", "revision 2"]);
+        assert!(first_export
+            .records
+            .iter()
+            .filter(|record| record.origin.kind == "cve_revision")
+            .all(|record| record.payload["version"]["revision"].is_string()));
+        assert!(!encoded.contains("/private/nvd/raw.json"));
+        assert!(!encoded.contains(&artifact_path.to_string_lossy().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn cve_ingest_rejects_unsafe_missing_mismatched_and_cross_source_artifacts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let artifact_path = directory.path().join("raw.json");
+        fs::write(&artifact_path, b"authoritative")?;
+        let store = Store::open(
+            directory.path().join("db.sqlite"),
+            directory.path().join("artifacts"),
+        )?;
+        let (record, version, artifact) = cve_fixture(
+            &artifact_path,
+            0,
+            "1",
+            "CVE-2024-1234:nvd:1",
+            "nvd",
+            "https://private.example.test/nvd.json",
+        );
+        assert!(store.ingest_cve(&record, &version, &[]).is_err());
+
+        let mut wrong_digest_record = record.clone();
+        wrong_digest_record.provenance.references[0].content_sha256 = Some("0".repeat(64));
+        let mut wrong_digest_version = version.clone();
+        wrong_digest_version.provenance = wrong_digest_record.provenance.clone();
+        assert!(store
+            .ingest_cve(
+                &wrong_digest_record,
+                &wrong_digest_version,
+                std::slice::from_ref(&artifact)
+            )
+            .is_err());
+
+        let mut cross_source = artifact.clone();
+        cross_source.source_id = StableId::new("vendor").unwrap();
+        assert!(store
+            .ingest_cve(&record, &version, &[cross_source])
+            .is_err());
+
+        let mut unsafe_record = record.clone();
+        unsafe_record.provenance.references[0].locator =
+            "https://user:password@example.test/nvd.json".into();
+        let mut unsafe_version = version.clone();
+        unsafe_version.provenance = unsafe_record.provenance.clone();
+        assert!(store
+            .ingest_cve(
+                &unsafe_record,
+                &unsafe_version,
+                std::slice::from_ref(&artifact),
+            )
+            .is_err());
+
+        let signed_locator =
+            "https://private.example.test/nvd.json?X-Amz-Credential=access&X-Amz-Signature=deadbeef";
+        let mut signed_record = record.clone();
+        signed_record.provenance.references[0].locator = signed_locator.into();
+        let mut signed_version = version.clone();
+        signed_version.provenance = signed_record.provenance.clone();
+        let mut signed_artifact = artifact.clone();
+        signed_artifact.locator = signed_locator.into();
+        assert!(store
+            .ingest_cve(&signed_record, &signed_version, &[signed_artifact])
+            .is_err());
+
+        let accepted = store.ingest_cve(&record, &version, &[artifact])?;
+        assert!(accepted.inserted);
+        let stored_path = directory
+            .path()
+            .join("artifacts/sha256")
+            .join(
+                &record.provenance.references[0]
+                    .content_sha256
+                    .as_ref()
+                    .unwrap()[..2],
+            )
+            .join(
+                record.provenance.references[0]
+                    .content_sha256
+                    .as_ref()
+                    .unwrap(),
+            );
+        fs::write(stored_path, b"tampered")?;
+        assert!(store.ingest_cve(&record, &version, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cve_conflict_rolls_back_revision_and_provenance_rows() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let artifact_path = directory.path().join("raw.json");
+        fs::write(&artifact_path, b"authority")?;
+        let store = Store::open(
+            directory.path().join("db.sqlite"),
+            directory.path().join("artifacts"),
+        )?;
+        let (record, version, artifact) = cve_fixture(
+            &artifact_path,
+            0,
+            "1",
+            "CVE-2024-1234:nvd:1",
+            "nvd",
+            "private/nvd.json",
+        );
+        store.ingest_cve(&record, &version, std::slice::from_ref(&artifact))?;
+        let mut conflict = version.clone();
+        conflict.id = StableId::new("CVE-2024-1234:nvd:conflict").unwrap();
+        assert!(store.ingest_cve(&record, &conflict, &[artifact]).is_err());
+        let connection = store.conn()?;
+        let versions: i64 =
+            connection.query_row("SELECT COUNT(*) FROM cve_versions", [], |row| row.get(0))?;
+        let provenance: i64 =
+            connection.query_row("SELECT COUNT(*) FROM cve_version_provenance", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(versions, 1);
+        assert_eq!(provenance, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cve_commit_failure_removes_new_artifacts_but_preserves_reused_files() -> Result<()> {
+        for reused in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let artifact_path = directory.path().join("raw.json");
+            fs::write(&artifact_path, b"authority")?;
+            let store = Store::open(
+                directory.path().join("db.sqlite"),
+                directory.path().join("artifacts"),
+            )?;
+            let (record, version, artifact) = cve_fixture(
+                &artifact_path,
+                0,
+                "1",
+                "CVE-2024-1234:nvd:1",
+                "nvd",
+                "private/nvd.json",
+            );
+            let digest = record.provenance.references[0]
+                .content_sha256
+                .as_deref()
+                .unwrap();
+            let installed_path = store
+                .artifact_root
+                .join(format!("sha256/{}/{digest}", &digest[..2]));
+            if reused {
+                assert!(atomic_write_verified(
+                    &installed_path,
+                    b"authority",
+                    digest
+                )?);
+            }
+
+            let mut read_lock = None;
+            let error = store
+                .ingest_cve_with_before_commit(
+                    &record,
+                    &version,
+                    std::slice::from_ref(&artifact),
+                    |transaction| {
+                        assert!(installed_path.exists());
+                        transaction.busy_timeout(Duration::ZERO)?;
+                        let connection = store.conn()?;
+                        connection.execute_batch("BEGIN DEFERRED")?;
+                        connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?;
+                        read_lock = Some(connection);
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("database is locked"));
+            assert_eq!(installed_path.exists(), reused);
+
+            drop(read_lock.take());
+            let connection = store.conn()?;
+            for table in ["artifacts", "artifact_owners", "cve_versions"] {
+                let count: i64 =
+                    connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(count, 0, "unexpected rows in {table}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cve_commit_error_returns_success_when_complete_state_committed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let artifact_path = directory.path().join("raw.json");
+        fs::write(&artifact_path, b"authority")?;
+        let store = Store::open(
+            directory.path().join("db.sqlite"),
+            directory.path().join("artifacts"),
+        )?;
+        let (record, version, artifact) = cve_fixture(
+            &artifact_path,
+            0,
+            "1",
+            "CVE-2024-1234:nvd:1",
+            "nvd",
+            "private/nvd.json",
+        );
+        let digest = record.provenance.references[0]
+            .content_sha256
+            .as_deref()
+            .unwrap();
+        let installed_path = store
+            .artifact_root
+            .join(format!("sha256/{}/{digest}", &digest[..2]));
+
+        let result =
+            store.ingest_cve_with_before_commit(&record, &version, &[artifact], |transaction| {
+                // Deterministically model a provider that committed but then
+                // reported an error to its caller.
+                transaction.execute_batch("COMMIT")?;
+                bail!("simulated ambiguous commit result")
+            })?;
+
+        assert!(result.inserted);
+        assert!(result.current);
+        assert!(installed_path.exists());
+        assert_eq!(
+            store.current_cve(record.id.as_str())?.version.id,
+            version.id
+        );
+        let connection = store.conn()?;
+        let versions: i64 =
+            connection.query_row("SELECT COUNT(*) FROM cve_versions", [], |row| row.get(0))?;
+        let provenance: i64 =
+            connection.query_row("SELECT COUNT(*) FROM cve_version_provenance", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(versions, 1);
+        assert_eq!(provenance, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cve_commit_failure_retains_file_when_artifact_was_already_cataloged() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let artifact_path = directory.path().join("raw.json");
+        fs::write(&artifact_path, b"authority")?;
+        let store = Store::open(
+            directory.path().join("db.sqlite"),
+            directory.path().join("artifacts"),
+        )?;
+        let (record, version, artifact) = cve_fixture(
+            &artifact_path,
+            0,
+            "1",
+            "CVE-2024-1234:nvd:1",
+            "nvd",
+            "private/nvd.json",
+        );
+        let digest = record.provenance.references[0]
+            .content_sha256
+            .as_deref()
+            .unwrap();
+        let relative_path = format!("sha256/{}/{digest}", &digest[..2]);
+        let installed_path = store.artifact_root.join(&relative_path);
+        store.conn()?.execute(
+            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![digest, 9_i64, relative_path, "application/json", record.modified_at.to_rfc3339()],
+        )?;
+        assert!(!installed_path.exists());
+
+        let mut read_lock = None;
+        let error = store
+            .ingest_cve_with_before_commit(&record, &version, &[artifact], |transaction| {
+                transaction.busy_timeout(Duration::ZERO)?;
+                let connection = store.conn()?;
+                connection.execute_batch("BEGIN DEFERRED")?;
+                connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                read_lock = Some(connection);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("indeterminate"));
+        assert!(installed_path.exists());
+        drop(read_lock.take());
+        let connection = store.conn()?;
+        let versions: i64 =
+            connection.query_row("SELECT COUNT(*) FROM cve_versions", [], |row| row.get(0))?;
+        let artifacts: i64 =
+            connection.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))?;
+        assert_eq!(versions, 0);
+        assert_eq!(artifacts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cve_absent_reconciliation_guards_cleanup_from_concurrent_catalog_writes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let artifact_path = directory.path().join("raw.json");
+        fs::write(&artifact_path, b"authority")?;
+        let store = Store::open(
+            directory.path().join("db.sqlite"),
+            directory.path().join("artifacts"),
+        )?;
+        let journal = store.conn()?;
+        journal.pragma_update(None, "journal_mode", "WAL")?;
+        drop(journal);
+
+        let (record, version, _) = cve_fixture(
+            &artifact_path,
+            0,
+            "1",
+            "CVE-2024-1234:nvd:1",
+            "nvd",
+            "private/nvd.json",
+        );
+        let digest = record.provenance.references[0]
+            .content_sha256
+            .as_deref()
+            .unwrap();
+        let relative_path = format!("sha256/{}/{digest}", &digest[..2]);
+        let installed_path = store.artifact_root.join(&relative_path);
+        assert!(atomic_write_verified(
+            &installed_path,
+            b"authority",
+            digest
+        )?);
+
+        let references = cve_references(&record, &version)?;
+        let record_json = cve::cve_record_storage_json(&record)?;
+        let version_json = cve::cve_version_storage_json(&version)?;
+        let commit_error = anyhow::anyhow!("simulated failed commit");
+        let writer = store.conn()?;
+        writer.busy_timeout(Duration::ZERO)?;
+        let probe = CveCommitProbe {
+            record: &record,
+            version: &version,
+            references: &references,
+            record_json: &record_json,
+            version_json: &version_json,
+            installed_paths: std::slice::from_ref(&installed_path),
+        };
+        let state = store.reconcile_cve_commit_with_absent_guard(
+            probe,
+            &commit_error,
+            || {
+                assert!(installed_path.exists());
+                let write_error = writer
+                    .execute(
+                        "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)",
+                        params![digest, 9_i64, relative_path, "application/json", record.modified_at.to_rfc3339()],
+                    )
+                    .unwrap_err();
+                assert!(write_error.to_string().contains("database is locked"));
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(state, CveCommitState::Absent);
+        assert!(!installed_path.exists());
+        writer.execute(
+            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![digest, 9_i64, relative_path, "application/json", record.modified_at.to_rfc3339()],
+        )?;
+        let cataloged: bool = writer.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE sha256=?1)",
+            params![digest],
+            |row| row.get(0),
+        )?;
+        assert!(cataloged);
+        Ok(())
+    }
+
+    #[test]
+    fn cve_absent_commit_state_requires_every_catalog_signal_to_be_absent() {
+        assert_eq!(
+            decide_cve_commit_state(false, false, false),
+            CveCommitState::Absent
+        );
+        for signals in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                decide_cve_commit_state(signals.0, signals.1, signals.2),
+                CveCommitState::Indeterminate
+            );
+        }
+    }
+
+    #[test]
+    fn failed_cve_ingest_removes_new_artifacts_but_preserves_reused_files() -> Result<()> {
+        for reused in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let artifact_path = directory.path().join("raw.json");
+            fs::write(&artifact_path, b"authority")?;
+            let store = Store::open(
+                directory.path().join("db.sqlite"),
+                directory.path().join("artifacts"),
+            )?;
+            let (mut record, mut version, artifact) = cve_fixture(
+                &artifact_path,
+                0,
+                "1",
+                "CVE-2024-1234:nvd:1",
+                "nvd",
+                "private/nvd.json",
+            );
+            let digest = record.provenance.references[0]
+                .content_sha256
+                .as_deref()
+                .unwrap();
+            let installed_path = store
+                .artifact_root
+                .join(format!("sha256/{}/{digest}", &digest[..2]));
+            if reused {
+                assert!(atomic_write_verified(
+                    &installed_path,
+                    b"authority",
+                    digest
+                )?);
+            }
+            let missing = SourceReference {
+                source_id: StableId::new("nvd")?,
+                locator: "private/missing.json".into(),
+                content_sha256: Some("f".repeat(64)),
+                retrieved_at: record.modified_at,
+                source_version: Some("1".into()),
+            };
+            record.provenance.references.push(missing.clone());
+            version.provenance.references.push(missing);
+
+            assert!(store.ingest_cve(&record, &version, &[artifact]).is_err());
+            assert_eq!(installed_path.exists(), reused);
+            let connection = store.conn()?;
+            for table in ["artifacts", "artifact_owners", "cve_versions"] {
+                let count: i64 =
+                    connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(count, 0, "unexpected rows in {table}");
+            }
+        }
         Ok(())
     }
 }

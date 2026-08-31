@@ -1,10 +1,11 @@
 //! Validated, provenance-preserving CVE and inventory domain contracts.
 //!
-//! This module is intentionally persistence- and transport-agnostic. Callers must
-//! validate records before storing or sending them to an adapter.
+//! Persistence adapters must revalidate these records at their transaction boundary.
 
+use anyhow::{bail, Context, Result as AnyResult};
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -118,6 +119,85 @@ impl SourceReference {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageLocator(String);
+
+impl StorageLocator {
+    pub(crate) fn new(locator: &str) -> Result<Self, ValidationError> {
+        validate_text(locator, "locator")?;
+        if let Ok(url) = url::Url::parse(locator) {
+            if !matches!(url.scheme(), "http" | "https" | "file") {
+                return Err(ValidationError::UnsafeLocator("locator"));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(ValidationError::UnsafeLocator("locator"));
+            }
+            if url.scheme() == "file" && (url.query().is_some() || url.fragment().is_some()) {
+                return Err(ValidationError::UnsafeLocator("locator"));
+            }
+            if url.query_pairs().any(|(key, _)| sensitive_query_key(&key)) {
+                return Err(ValidationError::UnsafeLocator("locator"));
+            }
+        } else if locator.split_once('?').is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|part| sensitive_query_key(part.split_once('=').map_or(part, |(key, _)| key)))
+        }) {
+            return Err(ValidationError::UnsafeLocator("locator"));
+        }
+        Ok(Self(locator.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn sensitive_query_key(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .map(char::from)
+        .collect::<String>();
+    matches!(normalized.as_str(), "key" | "sig" | "auth")
+        || [
+            "token",
+            "apikey",
+            "secret",
+            "password",
+            "passwd",
+            "credential",
+            "signature",
+            "authorization",
+            "authentication",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+#[derive(Serialize)]
+struct StorageSourceReference<'a> {
+    source_id: &'a StableId,
+    locator: String,
+    content_sha256: &'a Option<String>,
+    retrieved_at: DateTime<Utc>,
+    source_version: &'a Option<String>,
+}
+
+impl SourceReference {
+    fn storage_view(&self) -> Result<StorageSourceReference<'_>, ValidationError> {
+        let locator = StorageLocator::new(&self.locator)?;
+        Ok(StorageSourceReference {
+            source_id: &self.source_id,
+            locator: locator.as_str().to_owned(),
+            content_sha256: &self.content_sha256,
+            retrieved_at: self.retrieved_at,
+            source_version: &self.source_version,
+        })
+    }
+}
+
 impl Serialize for SourceReference {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -219,6 +299,19 @@ impl Provenance {
         }
         Ok(())
     }
+
+    fn storage_value(&self) -> Result<serde_json::Value, ValidationError> {
+        let references = self
+            .references
+            .iter()
+            .map(SourceReference::storage_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(serde_json::json!({
+            "references": references,
+            "confidence": self.confidence,
+            "observed_at": self.observed_at,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,8 +390,27 @@ impl CveRecord {
                 }
             }
         }
-        self.provenance.validate()
+        self.provenance.validate()?;
+        if self.modified_at > self.provenance.observed_at {
+            return Err(ValidationError::InvalidTimestamp("modified_at"));
+        }
+        Ok(())
     }
+}
+
+pub(crate) fn cve_record_storage_json(record: &CveRecord) -> Result<String, ValidationError> {
+    record.validate()?;
+    serde_json::to_string(&serde_json::json!({
+        "id": record.id,
+        "aliases": record.aliases,
+        "descriptions": record.descriptions,
+        "cna": record.cna,
+        "published_at": record.published_at,
+        "modified_at": record.modified_at,
+        "withdrawn_at": record.withdrawn_at,
+        "provenance": record.provenance.storage_value()?,
+    }))
+    .map_err(|_| ValidationError::InvalidState("cve_record"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,8 +438,168 @@ impl CveVersion {
                 return Err(ValidationError::TooLong("field"));
             }
         }
-        self.provenance.validate()
+        self.provenance.validate()?;
+        if self.modified_at > self.provenance.observed_at {
+            return Err(ValidationError::InvalidTimestamp("modified_at"));
+        }
+        Ok(())
     }
+}
+
+pub(crate) fn cve_version_storage_json(version: &CveVersion) -> Result<String, ValidationError> {
+    version.validate()?;
+    serde_json::to_string(&serde_json::json!({
+        "id": version.id,
+        "cve_id": version.cve_id,
+        "revision": version.revision,
+        "modified_at": version.modified_at,
+        "fields": version.fields,
+        "provenance": version.provenance.storage_value()?,
+    }))
+    .map_err(|_| ValidationError::InvalidState("cve_version"))
+}
+
+/// One normalized revision produced from an authoritative CVE JSON 5.x record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CveJson5Revision {
+    pub record: CveRecord,
+    pub version: CveVersion,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCveJson5 {
+    data_type: String,
+    data_version: String,
+    cve_metadata: RawCveJson5Metadata,
+    containers: RawCveJson5Containers,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCveJson5Metadata {
+    cve_id: String,
+    assigner_org_id: String,
+    assigner_short_name: Option<String>,
+    state: String,
+    date_published: Option<DateTime<Utc>>,
+    date_updated: DateTime<Utc>,
+    serial: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCveJson5Containers {
+    cna: RawCveJson5Cna,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCveJson5Cna {
+    descriptions: Option<Vec<RawCveJson5Description>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCveJson5Description {
+    lang: String,
+    value: String,
+}
+
+/// Normalize a CVE Program JSON 5.0/5.1 record while binding it to the exact raw artifact.
+///
+/// `retrieved_at` is explicit rather than inferred from the document: source publication time is
+/// not evidence of when the operator acquired the bytes. Unknown schema versions and duplicate
+/// language descriptions fail closed instead of being normalized speculatively.
+pub fn adapt_cve_json5(
+    bytes: &[u8],
+    locator: &str,
+    retrieved_at: DateTime<Utc>,
+) -> AnyResult<CveJson5Revision> {
+    StorageLocator::new(locator).context("unsafe CVE JSON 5 source locator")?;
+    validate_timestamp(retrieved_at, "retrieved_at")?;
+    let raw: RawCveJson5 = serde_json::from_slice(bytes).context("parse CVE JSON 5 record")?;
+    if raw.data_type != "CVE_RECORD" {
+        bail!("CVE JSON 5 dataType must be CVE_RECORD")
+    }
+    if !matches!(raw.data_version.as_str(), "5.0" | "5.1") {
+        bail!("unsupported CVE JSON 5 dataVersion")
+    }
+    if !matches!(raw.cve_metadata.state.as_str(), "PUBLISHED" | "REJECTED") {
+        bail!("unsupported CVE JSON 5 state")
+    }
+    if raw.cve_metadata.date_updated > retrieved_at {
+        bail!("CVE JSON 5 dateUpdated is later than retrieval time")
+    }
+
+    let id = StableId::new(raw.cve_metadata.cve_id.clone())?;
+    validate_cve_id(id.as_str(), "cve_id")?;
+    let revision = raw.cve_metadata.serial.to_string();
+    let source_version = format!("{}:{revision}", raw.data_version);
+    let source = SourceReference {
+        source_id: StableId::new("cve-program")?,
+        locator: locator.to_owned(),
+        content_sha256: Some(
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ),
+        retrieved_at,
+        source_version: Some(source_version),
+    };
+    source.validate()?;
+    let provenance = Provenance {
+        references: vec![source],
+        confidence: Confidence::Exact,
+        observed_at: retrieved_at,
+    };
+
+    let mut descriptions = BTreeMap::new();
+    for description in raw.containers.cna.descriptions.unwrap_or_default() {
+        if descriptions
+            .insert(description.lang, description.value)
+            .is_some()
+        {
+            bail!("duplicate CVE JSON 5 description language")
+        }
+    }
+    let cna = raw
+        .cve_metadata
+        .assigner_short_name
+        .or_else(|| Some(raw.cve_metadata.assigner_org_id.clone()));
+    let record = CveRecord {
+        id: id.clone(),
+        aliases: Vec::new(),
+        descriptions,
+        cna,
+        published_at: raw.cve_metadata.date_published,
+        modified_at: raw.cve_metadata.date_updated,
+        withdrawn_at: None,
+        provenance: provenance.clone(),
+    };
+    let version = CveVersion {
+        id: StableId::new(format!(
+            "{}:cve-program:{revision}",
+            raw.cve_metadata.cve_id
+        ))?,
+        cve_id: id,
+        revision,
+        modified_at: raw.cve_metadata.date_updated,
+        fields: BTreeMap::from([
+            (
+                "assigner_org_id".into(),
+                raw.cve_metadata.assigner_org_id.into(),
+            ),
+            ("data_version".into(), raw.data_version.into()),
+            ("state".into(), raw.cve_metadata.state.into()),
+        ]),
+        provenance,
+    };
+    record
+        .validate()
+        .context("invalid normalized CVE JSON 5 record")?;
+    version
+        .validate()
+        .context("invalid normalized CVE JSON 5 revision")?;
+    Ok(CveJson5Revision { record, version })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,6 +1042,10 @@ fn validate_timestamp(value: DateTime<Utc>, field: &'static str) -> Result<(), V
     }
     Ok(())
 }
+pub(crate) fn validate_cve_identifier(value: &str) -> Result<(), ValidationError> {
+    validate_cve_id(value, "cve_id")
+}
+
 fn validate_cve_id(value: &str, field: &'static str) -> Result<(), ValidationError> {
     let bytes = value.as_bytes();
     let valid = bytes.len() >= 13
@@ -950,6 +1226,19 @@ mod tests {
         assert!(record.validate().is_err());
         record.withdrawn_at = Some(dt());
         assert!(record.validate().is_ok());
+        record.withdrawn_at = None;
+        record.modified_at = dt() + chrono::Duration::seconds(1);
+        assert!(record.validate().is_err());
+
+        let version = CveVersion {
+            id: StableId::new("version-1").unwrap(),
+            cve_id: StableId::new("CVE-2024-1234").unwrap(),
+            revision: "1".into(),
+            modified_at: dt() + chrono::Duration::seconds(1),
+            fields: BTreeMap::new(),
+            provenance: provenance(),
+        };
+        assert!(version.validate().is_err());
 
         let advisory = AdvisoryRecord {
             id: StableId::new("advisory-1").unwrap(),
@@ -988,6 +1277,54 @@ mod tests {
             assert!(!output.contains(secret), "public output leaked {secret}");
         }
         assert_eq!(output.matches("redacted").count(), 5);
+    }
+
+    #[test]
+    fn storage_locators_reject_credentials_and_preserve_safe_private_values() {
+        for locator in [
+            "https://alice:secret@example.test/cve.json",
+            "https://example.test/cve.json?token=secret",
+            "https://example.test/cve.json?api_key=secret",
+            "https://example.test/cve.json?X-Amz-Credential=access%2Fscope",
+            "https://example.test/cve.json?X-Amz-Signature=deadbeef",
+            "https://example.test/cve.json?x-goog-signature=deadbeef",
+            "https://example.test/cve.json?refresh_token=secret",
+            "data:application/json,secret",
+            "javascript:alert(1)",
+            "https://example.test/cve.json\nnext",
+        ] {
+            assert!(
+                StorageLocator::new(locator).is_err(),
+                "accepted {locator:?}"
+            );
+        }
+        for locator in [
+            "https://private.example.test/cve.json?year=2024",
+            "/srv/private/nvd/cve.json",
+            "private/nvd/cve.json",
+        ] {
+            let safe = StorageLocator::new(locator).unwrap();
+            assert_eq!(safe.as_str(), locator);
+        }
+
+        let mut record = CveRecord {
+            id: StableId::new("CVE-2024-1234").unwrap(),
+            aliases: vec![],
+            descriptions: BTreeMap::from([(String::from("en"), String::from("test"))]),
+            cna: None,
+            published_at: Some(dt()),
+            modified_at: dt(),
+            withdrawn_at: None,
+            provenance: provenance(),
+        };
+        record.provenance.references[0].locator = "/srv/private/nvd/cve.json".into();
+        let storage = cve_record_storage_json(&record).unwrap();
+        let public = serde_json::to_string(&record).unwrap();
+        assert!(storage.contains("/srv/private/nvd/cve.json"));
+        assert!(!public.contains("/srv/private/nvd/cve.json"));
+        record.provenance.references[0].locator =
+            "https://example.test/cve.json?password=secret".into();
+        assert!(cve_record_storage_json(&record).is_err());
     }
 
     #[test]
