@@ -636,15 +636,16 @@ impl Store {
         let cursor = cursor.map(decode_history_cursor).transpose()?;
         let c = self.conn()?;
         let mut statement = c.prepare(
-            "SELECT id,modified_at,record_json,version_json FROM cve_versions WHERE cve_id=?1 AND (?2 IS NULL OR modified_at < ?2 OR (modified_at = ?2 AND id < ?3)) ORDER BY modified_at DESC,id DESC LIMIT ?4",
+            "SELECT id,revision,modified_at,record_json,version_json FROM cve_versions WHERE cve_id=?1 AND (?2 IS NULL OR modified_at < ?2 OR (modified_at = ?2 AND (revision < ?3 OR (revision = ?3 AND id < ?4)))) ORDER BY modified_at DESC,revision DESC,id DESC LIMIT ?5",
         )?;
         let rows = statement
             .query_map(
                 params![
                     cve_id,
                     cursor.as_ref().map(|value| value.modified_at.as_str()),
+                    cursor.as_ref().map(|value| value.revision.as_str()),
                     cursor.as_ref().map(|value| value.id.as_str()),
-                    (limit + 1) as i64
+                    (limit + 1) as i64,
                 ],
                 |row| {
                     Ok((
@@ -652,6 +653,7 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )?
@@ -661,14 +663,16 @@ impl Store {
         let next_cursor = if has_more {
             selected
                 .last()
-                .map(|(id, modified_at, _, _)| encode_history_cursor(modified_at, id))
+                .map(|(id, revision, modified_at, _, _)| {
+                    encode_history_cursor(modified_at, revision, id)
+                })
                 .transpose()?
         } else {
             None
         };
         let items = selected
             .into_iter()
-            .map(|(_, _, record_json, version_json)| {
+            .map(|(_, _, _, record_json, version_json)| {
                 Ok(CveHistoryItem {
                     record: serde_json::from_str(&record_json)
                         .context("invalid stored CVE record")?,
@@ -1253,12 +1257,14 @@ fn verify_cve_artifact(
 #[derive(Debug, Serialize, Deserialize)]
 struct HistoryCursor {
     modified_at: String,
+    revision: String,
     id: String,
 }
 
-fn encode_history_cursor(modified_at: &str, id: &str) -> Result<String> {
+fn encode_history_cursor(modified_at: &str, revision: &str, id: &str) -> Result<String> {
     Ok(hex(&serde_json::to_vec(&HistoryCursor {
         modified_at: modified_at.to_owned(),
+        revision: revision.to_owned(),
         id: id.to_owned(),
     })?))
 }
@@ -1284,6 +1290,9 @@ fn decode_history_cursor(cursor: &str) -> Result<HistoryCursor> {
         serde_json::from_slice(&bytes).context("malformed history cursor")?;
     chrono::DateTime::parse_from_rfc3339(&decoded.modified_at)
         .context("malformed history cursor")?;
+    if decoded.revision.is_empty() || decoded.revision.chars().any(char::is_whitespace) {
+        bail!("malformed history cursor");
+    }
     StableId::new(decoded.id.clone()).context("malformed history cursor")?;
     Ok(decoded)
 }
