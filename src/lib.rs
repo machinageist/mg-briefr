@@ -633,7 +633,9 @@ impl Store {
         if !(1..=100).contains(&limit) {
             bail!("history limit must be between 1 and 100")
         }
-        let cursor = cursor.map(decode_history_cursor).transpose()?;
+        let cursor = cursor
+            .map(|value| decode_history_cursor(value, cve_id))
+            .transpose()?;
         let c = self.conn()?;
         let mut statement = c.prepare(
             "SELECT id,revision,modified_at,record_json,version_json FROM cve_versions WHERE cve_id=?1 AND (?2 IS NULL OR modified_at < ?2 OR (modified_at = ?2 AND (revision < ?3 OR (revision = ?3 AND id < ?4)))) ORDER BY modified_at DESC,revision DESC,id DESC LIMIT ?5",
@@ -664,7 +666,7 @@ impl Store {
             selected
                 .last()
                 .map(|(id, revision, modified_at, _, _)| {
-                    encode_history_cursor(modified_at, revision, id)
+                    encode_history_cursor(cve_id, modified_at, revision, id)
                 })
                 .transpose()?
         } else {
@@ -1256,21 +1258,29 @@ fn verify_cve_artifact(
 
 #[derive(Debug, Serialize, Deserialize)]
 struct HistoryCursor {
+    cve_id: String,
     modified_at: String,
     revision: String,
     id: String,
 }
 
-fn encode_history_cursor(modified_at: &str, revision: &str, id: &str) -> Result<String> {
+fn encode_history_cursor(
+    cve_id: &str,
+    modified_at: &str,
+    revision: &str,
+    id: &str,
+) -> Result<String> {
     Ok(hex(&serde_json::to_vec(&HistoryCursor {
+        cve_id: cve_id.to_owned(),
         modified_at: modified_at.to_owned(),
         revision: revision.to_owned(),
         id: id.to_owned(),
     })?))
 }
 
-fn decode_history_cursor(cursor: &str) -> Result<HistoryCursor> {
+fn decode_history_cursor(cursor: &str, expected_cve_id: &str) -> Result<HistoryCursor> {
     if cursor.is_empty()
+        || cursor.len() > 4096
         || !cursor.len().is_multiple_of(2)
         || !cursor.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -1288,6 +1298,9 @@ fn decode_history_cursor(cursor: &str) -> Result<HistoryCursor> {
         .collect::<Result<Vec<_>>>()?;
     let decoded: HistoryCursor =
         serde_json::from_slice(&bytes).context("malformed history cursor")?;
+    if decoded.cve_id != expected_cve_id {
+        bail!("history cursor belongs to a different CVE");
+    }
     chrono::DateTime::parse_from_rfc3339(&decoded.modified_at)
         .context("malformed history cursor")?;
     if decoded.revision.is_empty() || decoded.revision.chars().any(char::is_whitespace) {
