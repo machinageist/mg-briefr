@@ -2,10 +2,17 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use mg_brief::cve::{adapt_cve_json5, CveRecord, CveVersion, StableId};
-use mg_brief::{CveArtifactInput, Store};
+use mg_brief::{asset::AssetImportDocument, CveArtifactInput, Store};
 use serde::Deserialize;
 use serde_json::to_string_pretty;
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+const MAX_ASSET_IMPORT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +51,31 @@ enum Command {
     Cve {
         #[command(subcommand)]
         command: CveCommand,
+    },
+    Asset {
+        #[command(subcommand)]
+        command: AssetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AssetCommand {
+    Import {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        as_of: Option<DateTime<Utc>>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    Inspect {
+        asset_id: String,
+        #[arg(long)]
+        as_of: Option<DateTime<Utc>>,
+        #[arg(long, default_value_t = 100)]
+        observation_limit: usize,
     },
 }
 
@@ -172,6 +204,44 @@ fn main() -> Result<()> {
                 to_string_pretty(&store.cve_history(&cve_id, limit, cursor.as_deref())?)?
             ),
         },
+        Command::Asset { command } => match command {
+            AssetCommand::Import { input } => {
+                let bytes = read_bounded_input(&input, MAX_ASSET_IMPORT_BYTES)?;
+                let document: AssetImportDocument = serde_json::from_slice(&bytes)?;
+                println!("{}", to_string_pretty(&store.import_assets(&document)?)?);
+            }
+            AssetCommand::List { as_of, limit } => println!(
+                "{}",
+                to_string_pretty(&store.list_assets(as_of.unwrap_or_else(Utc::now), limit)?)?
+            ),
+            AssetCommand::Inspect {
+                asset_id,
+                as_of,
+                observation_limit,
+            } => println!(
+                "{}",
+                to_string_pretty(&store.inspect_asset(
+                    &asset_id,
+                    as_of.unwrap_or_else(Utc::now),
+                    observation_limit
+                )?)?
+            ),
+        },
     }
     Ok(())
+}
+
+fn read_bounded_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        anyhow::bail!("asset import document is unavailable or too large")
+    }
+    let mut file = File::open(path)?;
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref().take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("asset import document is unavailable or too large")
+    }
+    Ok(bytes)
 }

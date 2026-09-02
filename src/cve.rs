@@ -729,47 +729,96 @@ pub enum AssetKind {
 pub struct Asset {
     pub id: StableId,
     pub kind: AssetKind,
-    pub vendor: Option<String>,
-    pub product: String,
-    pub model: Option<String>,
-    pub installed_version: Option<String>,
-    pub package: Option<String>,
-    pub purl: Option<String>,
-    pub cpe: Option<String>,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
     pub provenance: Provenance,
-    pub stale_after: Option<DateTime<Utc>>,
-    pub user_corrected: bool,
 }
 impl Asset {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_token(self.id.as_str(), "id")?;
-        validate_token(&self.product, "product")?;
-        for (field, value) in [
-            ("vendor", self.vendor.as_ref()),
-            ("model", self.model.as_ref()),
-            ("installed_version", self.installed_version.as_ref()),
-            ("package", self.package.as_ref()),
-            ("purl", self.purl.as_ref()),
-            ("cpe", self.cpe.as_ref()),
-        ] {
-            if let Some(value) = value {
-                validate_text(value, field)?;
-            }
-        }
-        if self.kind == AssetKind::Software
-            && self.installed_version.is_none()
-            && self.package.is_none()
-            && self.purl.is_none()
-            && self.cpe.is_none()
-        {
-            return Err(ValidationError::InvalidState("software asset identity"));
-        }
+        validate_text(&self.label, "label")?;
+        validate_timestamp(self.created_at, "created_at")?;
         self.provenance.validate()?;
-        if let Some(t) = self.stale_after {
-            validate_timestamp(t, "stale_after")?;
+        if self.provenance.observed_at != self.created_at {
+            return Err(ValidationError::InvalidTimestamp("asset provenance"));
         }
         Ok(())
     }
+
+    pub(crate) fn storage_value(&self) -> Result<serde_json::Value, ValidationError> {
+        Ok(serde_json::json!({
+            "id": self.id,
+            "kind": self.kind,
+            "label": self.label,
+            "created_at": self.created_at,
+            "provenance": self.provenance.storage_value()?,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetObservationOriginKind {
+    Collector,
+    UserCorrection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAssetObservationOrigin")]
+pub struct AssetObservationOrigin {
+    pub kind: AssetObservationOriginKind,
+    pub name: String,
+}
+
+impl AssetObservationOrigin {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_token(&self.name, "observation origin name")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawNormalizedAssetCandidate")]
+pub struct NormalizedAssetCandidate {
+    pub kind: String,
+    pub value: String,
+    pub confidence: Confidence,
+}
+
+impl NormalizedAssetCandidate {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_token(&self.kind, "candidate kind")?;
+        validate_text(&self.value, "candidate value")
+    }
+}
+
+impl Serialize for NormalizedAssetCandidate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Public<'a> {
+            kind: &'a str,
+            value: &'a str,
+            confidence: Confidence,
+            status: &'static str,
+        }
+        Public {
+            kind: &self.kind,
+            value: &self.value,
+            confidence: self.confidence,
+            status: "candidate_only",
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetObservationCoverage {
+    Complete,
+    Incomplete,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -777,10 +826,13 @@ impl Asset {
 pub struct AssetObservation {
     pub id: StableId,
     pub asset_id: StableId,
-    pub collector: String,
+    pub origin: AssetObservationOrigin,
     pub raw_identifier: String,
-    pub normalized_candidates: Vec<String>,
+    pub normalized_candidates: Vec<NormalizedAssetCandidate>,
+    pub coverage: AssetObservationCoverage,
     pub observed_at: DateTime<Utc>,
+    pub stale_after: Option<DateTime<Utc>>,
+    pub corrects_observation_id: Option<StableId>,
     pub evidence: Vec<String>,
     pub provenance: Provenance,
 }
@@ -788,20 +840,56 @@ impl AssetObservation {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_token(self.id.as_str(), "id")?;
         validate_token(self.asset_id.as_str(), "asset_id")?;
-        validate_token(&self.collector, "collector")?;
+        self.origin.validate()?;
         if self.normalized_candidates.len() > MAX_LIST_ITEMS || self.evidence.len() > MAX_LIST_ITEMS
         {
             return Err(ValidationError::TooLong("observation"));
         }
         for value in &self.normalized_candidates {
-            validate_token(value, "candidate")?;
+            value.validate()?;
         }
         for value in &self.evidence {
             validate_text(value, "evidence")?;
         }
-        validate_token(&self.raw_identifier, "raw_identifier")?;
+        validate_text(&self.raw_identifier, "raw_identifier")?;
         validate_timestamp(self.observed_at, "observed_at")?;
-        self.provenance.validate()
+        if let Some(stale_after) = self.stale_after {
+            validate_timestamp(stale_after, "stale_after")?;
+            if stale_after <= self.observed_at {
+                return Err(ValidationError::InvalidTimestamp("stale_after"));
+            }
+        }
+        if self.corrects_observation_id.as_ref() == Some(&self.id) {
+            return Err(ValidationError::InvalidState("corrected observation"));
+        }
+        match (self.origin.kind, self.corrects_observation_id.is_some()) {
+            (AssetObservationOriginKind::UserCorrection, false)
+            | (AssetObservationOriginKind::Collector, true) => {
+                return Err(ValidationError::InvalidState("corrected observation"));
+            }
+            _ => {}
+        }
+        self.provenance.validate()?;
+        if self.provenance.observed_at != self.observed_at {
+            return Err(ValidationError::InvalidTimestamp("observation provenance"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn storage_value(&self) -> Result<serde_json::Value, ValidationError> {
+        Ok(serde_json::json!({
+            "id": self.id,
+            "asset_id": self.asset_id,
+            "origin": self.origin,
+            "raw_identifier": self.raw_identifier,
+            "normalized_candidates": self.normalized_candidates,
+            "coverage": self.coverage,
+            "observed_at": self.observed_at,
+            "stale_after": self.stale_after,
+            "corrects_observation_id": self.corrects_observation_id,
+            "evidence": self.evidence,
+            "provenance": self.provenance.storage_value()?,
+        }))
     }
 }
 
@@ -963,13 +1051,19 @@ validated_wire!(RawAdvisoryRecord, AdvisoryRecord, {
     references: Vec<String>, source_version: Option<String>
 });
 validated_wire!(RawAsset, Asset, {
-    id: StableId, kind: AssetKind, vendor: Option<String>, product: String, model: Option<String>,
-    installed_version: Option<String>, package: Option<String>, purl: Option<String>, cpe: Option<String>,
-    provenance: Provenance, stale_after: Option<DateTime<Utc>>, user_corrected: bool
+    id: StableId, kind: AssetKind, label: String, created_at: DateTime<Utc>, provenance: Provenance
+});
+validated_wire!(RawAssetObservationOrigin, AssetObservationOrigin, {
+    kind: AssetObservationOriginKind, name: String
+});
+validated_wire!(RawNormalizedAssetCandidate, NormalizedAssetCandidate, {
+    kind: String, value: String, confidence: Confidence
 });
 validated_wire!(RawAssetObservation, AssetObservation, {
-    id: StableId, asset_id: StableId, collector: String, raw_identifier: String,
-    normalized_candidates: Vec<String>, observed_at: DateTime<Utc>, evidence: Vec<String>, provenance: Provenance
+    id: StableId, asset_id: StableId, origin: AssetObservationOrigin, raw_identifier: String,
+    normalized_candidates: Vec<NormalizedAssetCandidate>, coverage: AssetObservationCoverage,
+    observed_at: DateTime<Utc>, stale_after: Option<DateTime<Utc>>,
+    corrects_observation_id: Option<StableId>, evidence: Vec<String>, provenance: Provenance
 });
 validated_wire!(RawMatchEvidence, MatchEvidence, {
     kind: String, value: String, source: Option<SourceReference>, explanation: String

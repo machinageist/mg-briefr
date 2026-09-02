@@ -1,3 +1,4 @@
+pub mod asset;
 pub mod cve;
 
 use anyhow::{bail, Context, Result};
@@ -1394,7 +1395,7 @@ fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
 }
 
 fn migrate(c: &mut Connection) -> Result<()> {
-    const LATEST: i64 = 3;
+    const LATEST: i64 = 4;
     // Keep ledger discovery and every migration in one write transaction. In
     // particular, do not inspect the ledger before acquiring SQLite's write
     // lock: two first-time opens could otherwise both observe an empty ledger
@@ -1421,6 +1422,7 @@ fn migrate(c: &mut Connection) -> Result<()> {
             1 => tx.execute_batch("CREATE TABLE sources (id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,url TEXT NOT NULL UNIQUE,user_agent TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL); CREATE TABLE fetch_runs (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),started_at TEXT NOT NULL,finished_at TEXT,status TEXT NOT NULL,http_status INTEGER,final_url TEXT,error TEXT); CREATE TABLE artifacts (id INTEGER PRIMARY KEY,sha256 TEXT NOT NULL UNIQUE,byte_len INTEGER NOT NULL,relative_path TEXT NOT NULL UNIQUE,media_type TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE feed_items (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),identity_key TEXT NOT NULL,guid TEXT,url TEXT,title TEXT NOT NULL,published_at TEXT,first_seen_at TEXT NOT NULL,UNIQUE(source_id,identity_key)); CREATE TABLE provenance (id INTEGER PRIMARY KEY,fetch_run_id INTEGER NOT NULL REFERENCES fetch_runs(id),artifact_id INTEGER NOT NULL REFERENCES artifacts(id),item_id INTEGER REFERENCES feed_items(id),source_url TEXT NOT NULL,fetched_at TEXT NOT NULL);")?,
             2 => tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);")?,
             3 => tx.execute_batch("CREATE TABLE artifact_owners (source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id TEXT PRIMARY KEY,cve_id TEXT NOT NULL,revision TEXT NOT NULL,modified_at TEXT NOT NULL,record_json TEXT NOT NULL,version_json TEXT NOT NULL,observed_at TEXT NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id TEXT PRIMARY KEY,version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id TEXT NOT NULL REFERENCES cve_versions(id),ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,retrieved_at TEXT NOT NULL,source_version TEXT,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);")?,
+            4 => tx.execute_batch("CREATE TABLE asset_records (id TEXT PRIMARY KEY,created_at TEXT NOT NULL,asset_json TEXT NOT NULL); CREATE TABLE asset_observations (id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES asset_records(id),observed_at TEXT NOT NULL,corrects_observation_id TEXT REFERENCES asset_observations(id),observation_json TEXT NOT NULL); CREATE INDEX idx_asset_observations_asset_time ON asset_observations(asset_id,observed_at DESC,id DESC);")?,
             _ => unreachable!(),
         }
         tx.execute(
@@ -2157,7 +2159,7 @@ mod tests {
             .prepare("SELECT version FROM schema_migrations ORDER BY version")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
         Ok(())
     }
 
