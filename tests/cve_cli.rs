@@ -61,6 +61,20 @@ fn ingest_document(artifact: &Path, revision: &str, version_id: &str, timestamp:
 }
 
 #[test]
+fn status_is_read_only_and_reports_unconfigured_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("missing/catalog.sqlite");
+    let artifact_root = directory.path().join("missing/artifacts");
+    let output = run(&db, &artifact_root, &["status"]);
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], "mg.brief.status/1");
+    assert_eq!(value["status"], "unconfigured");
+    assert!(!db.exists());
+    assert!(!artifact_root.exists());
+}
+
+#[test]
 fn cve_cli_ingest_current_history_pagination_and_redaction() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("catalog.sqlite");

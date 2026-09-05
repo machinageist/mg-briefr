@@ -16,11 +16,16 @@ cargo run -- register security-advisories https://example.invalid/feed.xml
 cargo run -- sources
 cargo run -- fetch security-advisories --max-bytes 1048576 --timeout-seconds 20
 cargo run -- export --json > brief-snapshot.json
+cargo run -- status
 ```
 
 Network access is explicit in `fetch`. Requests are bounded by bytes and timeout, redirects
 are bounded, private/link-local targets are rejected, and source artifacts retain provenance.
 A failed fetch is a recorded failed run, not an implicit fallback.
+
+`status` is read-only: it opens the existing catalog without migrations or recovery and emits
+`mg.brief.status/1` with catalog counts. A missing or unreadable catalog is reported as an
+explicit unconfigured/unavailable state rather than creating files.
 
 CVE and asset commands are available under `cve` and `asset`:
 

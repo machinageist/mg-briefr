@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use mg_brief::cve::{adapt_cve_json5, CveRecord, CveVersion, StableId};
 use mg_brief::{asset::AssetImportDocument, CveArtifactInput, Store};
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::to_string_pretty;
 use std::{
@@ -48,6 +49,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Status,
+    /// Report embedded migration state without opening the store for writing
+    Migrations,
     Cve {
         #[command(subcommand)]
         command: CveCommand,
@@ -123,9 +127,73 @@ fn defaults() -> (PathBuf, PathBuf) {
             .unwrap_or_else(|| config.join("mg-brief/artifacts")),
     )
 }
+
+fn status(db: &Path) -> serde_json::Value {
+    if !db.is_file() {
+        return serde_json::json!({
+            "schema": "mg.brief.status/1",
+            "status": "unconfigured",
+            "counts": {"sources": 0, "cve_records": 0, "assets": 0}
+        });
+    }
+    let connection = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(connection) => connection,
+        Err(_) => {
+            return serde_json::json!({
+                "schema": "mg.brief.status/1",
+                "status": "unavailable",
+                "counts": {"sources": 0, "cve_records": 0, "assets": 0}
+            })
+        }
+    };
+    let count = |table: &str| -> Option<i64> {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .ok()
+    };
+    let Some(sources) = count("sources") else {
+        return serde_json::json!({
+            "schema": "mg.brief.status/1",
+            "status": "unavailable",
+            "counts": {"sources": 0, "cve_records": 0, "assets": 0}
+        });
+    };
+    serde_json::json!({
+        "schema": "mg.brief.status/1",
+        "status": "ready",
+        "counts": {
+            "sources": sources,
+            "cve_records": count("cve_versions").unwrap_or(0),
+            "assets": count("asset_records").unwrap_or(0)
+        }
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let (db, root) = defaults();
+    if matches!(cli.command, Command::Status) {
+        println!("{}", to_string_pretty(&status(&cli.db.unwrap_or(db)))?);
+        return Ok(());
+    }
+    // Read the ledger without migrating, so a drifted catalog can be inspected
+    // rather than only refused.
+    if matches!(cli.command, Command::Migrations) {
+        let path = cli.db.unwrap_or(db);
+        let states = if path.is_file() {
+            let connection = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            mg_brief::migration_status(&connection)?
+        } else {
+            mg_brief::migration_status(&rusqlite::Connection::open_in_memory()?)?
+        };
+        println!("{}", to_string_pretty(&states)?);
+        return Ok(());
+    }
     let store = Store::open(cli.db.unwrap_or(db), cli.artifact_root.unwrap_or(root))?;
     match cli.command {
         Command::Register {
@@ -150,6 +218,9 @@ fn main() -> Result<()> {
                 anyhow::bail!("export requires --json")
             }
             println!("{}", to_string_pretty(&store.export_interop_snapshot()?)?)
+        }
+        Command::Status | Command::Migrations => {
+            unreachable!("both are handled before opening the store")
         }
         Command::Cve { command } => match command {
             CveCommand::ImportCve5 {

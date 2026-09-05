@@ -1394,8 +1394,127 @@ fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
     })
 }
 
+/// One embedded schema migration.
+///
+/// `checksum` pins the exact SQL that was applied. `tables` names what the
+/// migration is responsible for creating, so a ledger that records a version
+/// whose tables are absent is caught rather than skipped.
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub version: i64,
+    pub name: &'static str,
+    pub sql: &'static str,
+    pub checksum: &'static str,
+    pub tables: &'static [&'static str],
+}
+
+const M1_CATALOG_FOUNDATION: &str = "CREATE TABLE sources (id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,url TEXT NOT NULL UNIQUE,user_agent TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL); CREATE TABLE fetch_runs (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),started_at TEXT NOT NULL,finished_at TEXT,status TEXT NOT NULL,http_status INTEGER,final_url TEXT,error TEXT); CREATE TABLE artifacts (id INTEGER PRIMARY KEY,sha256 TEXT NOT NULL UNIQUE,byte_len INTEGER NOT NULL,relative_path TEXT NOT NULL UNIQUE,media_type TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE feed_items (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),identity_key TEXT NOT NULL,guid TEXT,url TEXT,title TEXT NOT NULL,published_at TEXT,first_seen_at TEXT NOT NULL,UNIQUE(source_id,identity_key)); CREATE TABLE provenance (id INTEGER PRIMARY KEY,fetch_run_id INTEGER NOT NULL REFERENCES fetch_runs(id),artifact_id INTEGER NOT NULL REFERENCES artifacts(id),item_id INTEGER REFERENCES feed_items(id),source_url TEXT NOT NULL,fetched_at TEXT NOT NULL);";
+const M2_FEED_ITEM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);";
+const M3_CVE_INTELLIGENCE: &str = "CREATE TABLE artifact_owners (source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id TEXT PRIMARY KEY,cve_id TEXT NOT NULL,revision TEXT NOT NULL,modified_at TEXT NOT NULL,record_json TEXT NOT NULL,version_json TEXT NOT NULL,observed_at TEXT NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id TEXT PRIMARY KEY,version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id TEXT NOT NULL REFERENCES cve_versions(id),ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,retrieved_at TEXT NOT NULL,source_version TEXT,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);";
+const M4_ASSET_INVENTORY: &str = "CREATE TABLE asset_records (id TEXT PRIMARY KEY,created_at TEXT NOT NULL,asset_json TEXT NOT NULL); CREATE TABLE asset_observations (id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES asset_records(id),observed_at TEXT NOT NULL,corrects_observation_id TEXT REFERENCES asset_observations(id),observation_json TEXT NOT NULL); CREATE INDEX idx_asset_observations_asset_time ON asset_observations(asset_id,observed_at DESC,id DESC);";
+
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "catalog_foundation",
+        sql: M1_CATALOG_FOUNDATION,
+        checksum: "e31495b5cbd6028399518baa79f8f85a88e0a89a8a1a13b62d6f8ce3bf4b00c4",
+        tables: &[
+            "sources",
+            "fetch_runs",
+            "artifacts",
+            "feed_items",
+            "provenance",
+        ],
+    },
+    Migration {
+        version: 2,
+        name: "feed_item_index",
+        sql: M2_FEED_ITEM_INDEX,
+        checksum: "9c691f5ef305bfe22095bdc84ce48eddf835651f3ab5a018aca19e7413cbf36f",
+        tables: &[],
+    },
+    Migration {
+        version: 3,
+        name: "cve_intelligence",
+        sql: M3_CVE_INTELLIGENCE,
+        checksum: "d3400a86e83c295378696e41612372048f40f65c4c28ae2aee1fd9ff87ee065b",
+        tables: &[
+            "artifact_owners",
+            "cve_versions",
+            "cve_current",
+            "cve_version_provenance",
+        ],
+    },
+    Migration {
+        version: 4,
+        name: "asset_inventory",
+        sql: M4_ASSET_INVENTORY,
+        checksum: "889633572fc79f050fc7ff80317def6211e2698ffd3acf95f59ebd5f1d461724",
+        tables: &["asset_records", "asset_observations"],
+    },
+];
+
+/// State of one embedded migration against a live catalog.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MigrationState {
+    pub version: i64,
+    pub name: &'static str,
+    pub applied: bool,
+}
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Read migration state without opening a write transaction or applying anything.
+pub fn migration_status(c: &Connection) -> Result<Vec<MigrationState>> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+        [],
+        |r| r.get(0),
+    )?;
+    let applied: Vec<i64> = if exists {
+        let mut st = c.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+        let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(MIGRATIONS
+        .iter()
+        .map(|m| MigrationState {
+            version: m.version,
+            name: m.name,
+            applied: applied.contains(&m.version),
+        })
+        .collect())
+}
+
+/// Refuse an embedded migration whose SQL no longer matches its recorded checksum.
+///
+/// Without this the checksum is decoration: editing a migration's SQL and its
+/// checksum together would still let a rewritten migration reach a database.
+fn validate_embedded_migrations() -> Result<()> {
+    for migration in MIGRATIONS {
+        if sha256_hex(migration.sql) != migration.checksum {
+            bail!(
+                "embedded schema migration {} ('{}') does not match its checksum",
+                migration.version,
+                migration.name
+            )
+        }
+    }
+    Ok(())
+}
+
 fn migrate(c: &mut Connection) -> Result<()> {
-    const LATEST: i64 = 4;
+    validate_embedded_migrations()?;
+    let latest = MIGRATIONS.last().map_or(0, |m| m.version);
     // Keep ledger discovery and every migration in one write transaction. In
     // particular, do not inspect the ledger before acquiring SQLite's write
     // lock: two first-time opens could otherwise both observe an empty ledger
@@ -1404,34 +1523,97 @@ fn migrate(c: &mut Connection) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);",
     )?;
-    let versions = {
-        let mut st = tx.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
-        let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
+    // The ledger predates checksums. Add the column rather than rewriting the
+    // table, so an existing catalog keeps its history.
+    let has_checksum: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('schema_migrations') WHERE name='checksum')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_checksum {
+        tx.execute_batch("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT;")?;
+    }
+
+    let recorded = {
+        let mut st =
+            tx.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (index, version) in versions.iter().enumerate() {
+    for (index, (version, _)) in recorded.iter().enumerate() {
         let expected = index as i64 + 1;
-        if *version != expected || *version > LATEST {
+        if *version != expected || *version > latest {
             bail!("schema migration ledger is inconsistent")
         }
     }
-    let mut current = versions.last().copied().unwrap_or(0);
-    while current < LATEST {
+
+    verify_recorded_migrations(&tx, &recorded)?;
+
+    let mut current = recorded.last().map(|(v, _)| *v).unwrap_or(0);
+    while current < latest {
         let next = current + 1;
-        match next {
-            1 => tx.execute_batch("CREATE TABLE sources (id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,url TEXT NOT NULL UNIQUE,user_agent TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL); CREATE TABLE fetch_runs (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),started_at TEXT NOT NULL,finished_at TEXT,status TEXT NOT NULL,http_status INTEGER,final_url TEXT,error TEXT); CREATE TABLE artifacts (id INTEGER PRIMARY KEY,sha256 TEXT NOT NULL UNIQUE,byte_len INTEGER NOT NULL,relative_path TEXT NOT NULL UNIQUE,media_type TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE feed_items (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),identity_key TEXT NOT NULL,guid TEXT,url TEXT,title TEXT NOT NULL,published_at TEXT,first_seen_at TEXT NOT NULL,UNIQUE(source_id,identity_key)); CREATE TABLE provenance (id INTEGER PRIMARY KEY,fetch_run_id INTEGER NOT NULL REFERENCES fetch_runs(id),artifact_id INTEGER NOT NULL REFERENCES artifacts(id),item_id INTEGER REFERENCES feed_items(id),source_url TEXT NOT NULL,fetched_at TEXT NOT NULL);")?,
-            2 => tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);")?,
-            3 => tx.execute_batch("CREATE TABLE artifact_owners (source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id TEXT PRIMARY KEY,cve_id TEXT NOT NULL,revision TEXT NOT NULL,modified_at TEXT NOT NULL,record_json TEXT NOT NULL,version_json TEXT NOT NULL,observed_at TEXT NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id TEXT PRIMARY KEY,version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id TEXT NOT NULL REFERENCES cve_versions(id),ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,retrieved_at TEXT NOT NULL,source_version TEXT,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);")?,
-            4 => tx.execute_batch("CREATE TABLE asset_records (id TEXT PRIMARY KEY,created_at TEXT NOT NULL,asset_json TEXT NOT NULL); CREATE TABLE asset_observations (id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES asset_records(id),observed_at TEXT NOT NULL,corrects_observation_id TEXT REFERENCES asset_observations(id),observation_json TEXT NOT NULL); CREATE INDEX idx_asset_observations_asset_time ON asset_observations(asset_id,observed_at DESC,id DESC);")?,
-            _ => unreachable!(),
-        }
+        let migration = MIGRATIONS
+            .iter()
+            .find(|m| m.version == next)
+            .expect("embedded migrations are contiguous");
+        tx.execute_batch(migration.sql)?;
         tx.execute(
-            "INSERT INTO schema_migrations(version) VALUES (?1)",
-            params![next],
+            "INSERT INTO schema_migrations(version, checksum) VALUES (?1, ?2)",
+            params![next, migration.checksum],
         )?;
         current = next;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Refuse a catalog whose recorded migrations no longer match the embedded ones.
+///
+/// A migration edited after it was applied is invisible to a version-only
+/// ledger: the runner skips it and the new statements never run, leaving a
+/// database that reports itself current while missing tables. Compare the
+/// recorded checksum, and where a legacy row carries none, compare the live
+/// schema instead.
+fn verify_recorded_migrations(
+    tx: &rusqlite::Transaction<'_>,
+    recorded: &[(i64, Option<String>)],
+) -> Result<()> {
+    for (version, checksum) in recorded {
+        let Some(migration) = MIGRATIONS.iter().find(|m| m.version == *version) else {
+            bail!("catalog records unknown schema migration {version}")
+        };
+        if let Some(recorded_checksum) = checksum {
+            if recorded_checksum != migration.checksum {
+                bail!(
+                    "schema migration {version} ('{}') was changed after it was applied; \
+                     this catalog cannot be upgraded in place",
+                    migration.name
+                )
+            }
+            continue;
+        }
+        // Legacy row with no checksum: the live tables are the only evidence.
+        for table in migration.tables {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                params![table],
+                |r| r.get(0),
+            )?;
+            if !present {
+                bail!(
+                    "schema migration {version} ('{}') is recorded but table '{table}' is missing; \
+                     this catalog predates a change to that migration",
+                    migration.name
+                )
+            }
+        }
+        tx.execute(
+            "UPDATE schema_migrations SET checksum=?2 WHERE version=?1",
+            params![version, migration.checksum],
+        )?;
+    }
     Ok(())
 }
 
