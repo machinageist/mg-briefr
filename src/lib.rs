@@ -7,7 +7,7 @@ use cve::{CveRecord, CveVersion, SourceReference, StableId, StorageLocator};
 use feed_rs::parser;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use postgres::{Client as PgClient, NoTls};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,7 +31,7 @@ const STALE_RUN_AGE: ChronoDuration = ChronoDuration::hours(1);
 
 #[derive(Debug, Clone)]
 pub struct Store {
-    pub db_path: PathBuf,
+    pub database_url: String,
     pub artifact_root: PathBuf,
     trusted_file_root: Option<PathBuf>,
 }
@@ -199,12 +199,12 @@ impl Store {
         Ok(store)
     }
 
-    fn conn(&self) -> Result<Connection> {
-        let c = Connection::open(&self.db_path).context("open catalog")?;
-        c.busy_timeout(Duration::from_secs(5))
-            .context("configure catalog lock")?;
-        c.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(c)
+    // A fresh connection per call, deliberately. The CVE commit reconciliation
+    // has to open a second, independent connection while a transaction is still
+    // outstanding, which one shared client cannot do. PostgreSQL enforces foreign
+    // keys always, so there is no equivalent of the PRAGMA this used to set.
+    fn conn(&self) -> Result<PgClient> {
+        PgClient::connect(&self.database_url, NoTls).context("open catalog")
     }
 
     pub fn register(
@@ -222,15 +222,15 @@ impl Store {
             bail!("user-agent is invalid")
         }
         let c = self.conn()?;
-        c.execute("INSERT INTO sources(name,url,user_agent,created_at) VALUES (?1,?2,?3,?4) ON CONFLICT(name) DO UPDATE SET url=excluded.url,user_agent=excluded.user_agent,enabled=1", params![name, parsed.as_str(), ua, Utc::now().to_rfc3339()])?;
+        c.execute("INSERT INTO sources(name,url,user_agent,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT(name) DO UPDATE SET url=excluded.url,user_agent=excluded.user_agent,enabled=1", &[&name, &parsed.as_str(), &ua, &Utc::now().to_rfc3339()])?;
         self.source_by_name(name)
     }
 
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         let c = self.conn()?;
         if c.execute(
-            "UPDATE sources SET enabled=?1 WHERE name=?2",
-            params![enabled as i64, name],
+            "UPDATE sources SET enabled=$1 WHERE name=$2",
+            &[&enabled as i64, &name],
         )? != 1
         {
             bail!("source not found")
@@ -240,9 +240,8 @@ impl Store {
 
     pub fn source_by_name(&self, name: &str) -> Result<Source> {
         let c = self.conn()?;
-        c.query_row(
-            "SELECT id,name,url,user_agent,enabled FROM sources WHERE name=?1",
-            params![name],
+        c.query_one("SELECT id,name,url,user_agent,enabled FROM sources WHERE name=$1",
+            &[&name],
             source_from_row,
         )
         .optional()?
@@ -319,19 +318,15 @@ impl Store {
                     installed_paths.push(path);
                 }
                 tx.execute(
-                    "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(sha256) DO NOTHING",
-                    params![artifact.sha256, artifact.bytes.len() as i64, relative_path, artifact.media_type, record.provenance.observed_at.to_rfc3339()],
+                    "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(sha256) DO NOTHING",
+                    &[&artifact.sha256, &artifact.bytes.len() as i64, &relative_path, &artifact.media_type, &record.provenance.observed_at.to_rfc3339()],
                 )?;
                 let artifact_id: i64 = tx
-                    .query_row(
-                        "SELECT id FROM artifacts WHERE sha256=?1 AND byte_len=?2 AND relative_path=?3",
-                        params![artifact.sha256, artifact.bytes.len() as i64, relative_path],
-                        |row| row.get(0),
-                    )
+                    .query_one("SELECT id FROM artifacts WHERE sha256=$1 AND byte_len=$2 AND relative_path=$3", &[&artifact.sha256, &artifact.bytes.len() as i64, &relative_path]).map(|row| row.get(0))
                     .context("artifact catalog conflict")?;
                 tx.execute(
-                    "INSERT INTO artifact_owners(source_id,artifact_id,locator) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
-                    params![artifact.source_id, artifact_id, artifact.locator],
+                    "INSERT INTO artifact_owners(source_id,artifact_id,locator) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                    &[&artifact.source_id, &artifact_id, &artifact.locator],
                 )?;
             }
             for reference in &references {
@@ -339,9 +334,8 @@ impl Store {
             }
 
             let existing = tx
-                .query_row(
-                    "SELECT record_json,version_json FROM cve_versions WHERE id=?1",
-                    params![version.id.as_str()],
+                .query_one("SELECT record_json,version_json FROM cve_versions WHERE id=$1",
+                    &[&version.id.as_str()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
@@ -350,10 +344,7 @@ impl Store {
                     bail!("immutable CVE version conflict")
                 }
                 let current = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM cve_current WHERE cve_id=?1 AND version_id=?2)",
-                    params![record.id.as_str(), version.id.as_str()],
-                    |row| row.get::<_, bool>(0),
-                )?;
+                    "SELECT EXISTS(SELECT 1 FROM cve_current WHERE cve_id=$1 AND version_id=$2)", &[&record.id.as_str(), &version.id.as_str()]).map(|row| row.get::<_, bool>(0))?;
                 return Ok(CveIngestResult {
                     schema: JSON_VERSION,
                     cve_id: record.id.as_str().to_owned(),
@@ -364,35 +355,26 @@ impl Store {
                 });
             }
             if tx
-                .query_row(
-                    "SELECT id FROM cve_versions WHERE cve_id=?1 AND revision=?2",
-                    params![record.id.as_str(), version.revision],
-                    |row| row.get::<_, String>(0),
-                )
+                .query_one("SELECT id FROM cve_versions WHERE cve_id=$1 AND revision=$2", &[&record.id.as_str(), &version.revision]).map(|row| row.get::<_, String>(0))
                 .optional()?
                 .is_some()
             {
                 bail!("immutable CVE revision conflict")
             }
             tx.execute(
-                "INSERT INTO cve_versions(id,cve_id,revision,modified_at,record_json,version_json,observed_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![version.id.as_str(), record.id.as_str(), version.revision, version.modified_at.to_rfc3339(), record_json, version_json, record.provenance.observed_at.to_rfc3339()],
+                "INSERT INTO cve_versions(id,cve_id,revision,modified_at,record_json,version_json,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                &[&version.id.as_str(), &record.id.as_str(), &version.revision, &version.modified_at.to_rfc3339(), &record_json, &version_json, &record.provenance.observed_at.to_rfc3339()],
             )?;
             for (ordinal, reference) in references.iter().enumerate() {
-                let artifact_id: i64 = tx.query_row(
-                    "SELECT a.id FROM artifacts a JOIN artifact_owners o ON o.artifact_id=a.id WHERE o.source_id=?1 AND o.locator=?2 AND a.sha256=?3",
-                    params![reference.source_id.as_str(), reference.locator, reference.content_sha256.as_deref()],
-                    |row| row.get(0),
-                )?;
+                let artifact_id: i64 = tx.query_one("SELECT a.id FROM artifacts a JOIN artifact_owners o ON o.artifact_id=a.id WHERE o.source_id=$1 AND o.locator=$2 AND a.sha256=$3", &[&reference.source_id.as_str(), &reference.locator, &reference.content_sha256.as_deref()]).map(|row| row.get(0))?;
                 tx.execute(
-                    "INSERT INTO cve_version_provenance(version_id,ordinal,source_id,artifact_id,locator,retrieved_at,source_version) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    params![version.id.as_str(), ordinal as i64, reference.source_id.as_str(), artifact_id, reference.locator, reference.retrieved_at.to_rfc3339(), reference.source_version],
+                    "INSERT INTO cve_version_provenance(version_id,ordinal,source_id,artifact_id,locator,retrieved_at,source_version) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    &[&version.id.as_str(), &ordinal as i64, &reference.source_id.as_str(), &artifact_id, &reference.locator, &reference.retrieved_at.to_rfc3339(), &reference.source_version],
                 )?;
             }
             let current_key = tx
-                .query_row(
-                    "SELECT v.modified_at,v.revision,v.id FROM cve_current c JOIN cve_versions v ON v.id=c.version_id WHERE c.cve_id=?1",
-                    params![record.id.as_str()],
+                .query_one("SELECT v.modified_at,v.revision,v.id FROM cve_current c JOIN cve_versions v ON v.id=c.version_id WHERE c.cve_id=$1",
+                    &[&record.id.as_str()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
                 )
                 .optional()?;
@@ -406,8 +388,8 @@ impl Store {
             });
             if make_current {
                 tx.execute(
-                    "INSERT INTO cve_current(cve_id,version_id) VALUES (?1,?2) ON CONFLICT(cve_id) DO UPDATE SET version_id=excluded.version_id",
-                    params![record.id.as_str(), version.id.as_str()],
+                    "INSERT INTO cve_current(cve_id,version_id) VALUES ($1,$2) ON CONFLICT(cve_id) DO UPDATE SET version_id=excluded.version_id",
+                    &[&record.id.as_str(), &version.id.as_str()],
                 )?;
             }
             Ok(CveIngestResult {
@@ -488,8 +470,8 @@ impl Store {
             .context("guard post-commit catalog probe")?;
         let stored = tx
             .query_row(
-                "SELECT cve_id,revision,modified_at,record_json,version_json,observed_at FROM cve_versions WHERE id=?1",
-                params![version.id.as_str()],
+                "SELECT cve_id,revision,modified_at,record_json,version_json,observed_at FROM cve_versions WHERE id=$1",
+                &[&version.id.as_str()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -525,10 +507,10 @@ impl Store {
             }
 
             let mut statement = tx.prepare(
-                "SELECT p.ordinal,p.source_id,p.locator,p.retrieved_at,p.source_version,a.sha256,a.byte_len,a.relative_path,EXISTS(SELECT 1 FROM artifact_owners o WHERE o.source_id=p.source_id AND o.artifact_id=p.artifact_id AND o.locator=p.locator) FROM cve_version_provenance p JOIN artifacts a ON a.id=p.artifact_id WHERE p.version_id=?1 ORDER BY p.ordinal",
+                "SELECT p.ordinal,p.source_id,p.locator,p.retrieved_at,p.source_version,a.sha256,a.byte_len,a.relative_path,EXISTS(SELECT 1 FROM artifact_owners o WHERE o.source_id=p.source_id AND o.artifact_id=p.artifact_id AND o.locator=p.locator) FROM cve_version_provenance p JOIN artifacts a ON a.id=p.artifact_id WHERE p.version_id=$1 ORDER BY p.ordinal",
             )?;
             let rows = statement
-                .query_map(params![version.id.as_str()], |row| {
+                .query_map(&[&version.id.as_str()], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -567,34 +549,19 @@ impl Store {
                 }
             }
             let current = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM cve_current WHERE cve_id=?1 AND version_id=?2)",
-                params![record.id.as_str(), version.id.as_str()],
-                |row| row.get::<_, bool>(0),
-            )?;
+                "SELECT EXISTS(SELECT 1 FROM cve_current WHERE cve_id=$1 AND version_id=$2)", &[&record.id.as_str(), &version.id.as_str()]).map(|row| row.get::<_, bool>(0))?;
             return Ok(CveCommitState::Complete { current });
         }
 
-        let conflicting_version: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cve_versions WHERE cve_id=?1 AND revision=?2)",
-            params![record.id.as_str(), version.revision],
-            |row| row.get(0),
-        )?;
-        let dependent_rows: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cve_current WHERE version_id=?1) OR EXISTS(SELECT 1 FROM cve_version_provenance WHERE version_id=?1)",
-            params![version.id.as_str()],
-            |row| row.get(0),
-        )?;
+        let conflicting_version: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM cve_versions WHERE cve_id=$1 AND revision=$2)", &[&record.id.as_str(), &version.revision]).map(|row| row.get(0))?;
+        let dependent_rows: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM cve_current WHERE version_id=$1) OR EXISTS(SELECT 1 FROM cve_version_provenance WHERE version_id=$1)", &[&version.id.as_str()]).map(|row| row.get(0))?;
         let mut installed_cataloged = false;
         for path in installed_paths {
             let relative = path
                 .strip_prefix(&self.artifact_root)
                 .context("installed artifact escaped artifact root")?
                 .to_string_lossy();
-            installed_cataloged |= tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE relative_path=?1)",
-                params![relative.as_ref()],
-                |row| row.get::<_, bool>(0),
-            )?;
+            installed_cataloged |= tx.query_one("SELECT EXISTS(SELECT 1 FROM artifacts WHERE relative_path=$1)", &[&relative.as_ref()]).map(|row| row.get::<_, bool>(0))?;
         }
         let state =
             decide_cve_commit_state(conflicting_version, dependent_rows, installed_cataloged);
@@ -610,9 +577,8 @@ impl Store {
         cve::validate_cve_identifier(cve_id)?;
         let c = self.conn()?;
         let (record_json, version_json) = c
-            .query_row(
-                "SELECT v.record_json,v.version_json FROM cve_current current JOIN cve_versions v ON v.id=current.version_id WHERE current.cve_id=?1",
-                params![cve_id],
+            .query_one("SELECT v.record_json,v.version_json FROM cve_current current JOIN cve_versions v ON v.id=current.version_id WHERE current.cve_id=$1",
+                &[&cve_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
@@ -639,17 +605,11 @@ impl Store {
             .transpose()?;
         let c = self.conn()?;
         let mut statement = c.prepare(
-            "SELECT id,revision,modified_at,record_json,version_json FROM cve_versions WHERE cve_id=?1 AND (?2 IS NULL OR modified_at < ?2 OR (modified_at = ?2 AND (revision < ?3 OR (revision = ?3 AND id < ?4)))) ORDER BY modified_at DESC,revision DESC,id DESC LIMIT ?5",
+            "SELECT id,revision,modified_at,record_json,version_json FROM cve_versions WHERE cve_id=$1 AND ($2 IS NULL OR modified_at < $2 OR (modified_at = $2 AND (revision < $3 OR (revision = $3 AND id < $4)))) ORDER BY modified_at DESC,revision DESC,id DESC LIMIT $5",
         )?;
         let rows = statement
             .query_map(
-                params![
-                    cve_id,
-                    cursor.as_ref().map(|value| value.modified_at.as_str()),
-                    cursor.as_ref().map(|value| value.revision.as_str()),
-                    cursor.as_ref().map(|value| value.id.as_str()),
-                    (limit + 1) as i64,
-                ],
+                &[&cve_id, &cursor.as_ref().map(|value| value.modified_at.as_str()), &cursor.as_ref().map(|value| value.revision.as_str()), &cursor.as_ref().map(|value| value.id.as_str()), &(limit + 1) as i64],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -827,10 +787,7 @@ impl Store {
                     format!("mg-brief:feed_item:{item_id}"),
                 ));
                 let source_id: i64 = c.query_row(
-                    "SELECT source_id FROM feed_items WHERE id=?1",
-                    params![item_id],
-                    |r| r.get(0),
-                )?;
+                    "SELECT source_id FROM feed_items WHERE id=$1", &[&item_id]).map(|row| row.get(0))?;
                 links.push(interop_link(
                     "source->feed_item",
                     format!("mg-brief:source:{source_id}"),
@@ -1018,10 +975,10 @@ impl Store {
         let c = self.conn()?;
         let started = Utc::now().to_rfc3339();
         c.execute(
-            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES (?1,?2,'running')",
-            params![source.id, started],
+            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES ($1,$2,'running') RETURNING id",
+            &[&source.id, &started],
         )?;
-        let run_id = c.last_insert_rowid();
+        let run_id: i64 = run_row.get(0);
         match self.fetch_inner(&source, run_id, max_bytes, timeout_secs) {
             Ok((artifact, count, _status, _final_url)) => Ok(FetchResult {
                 schema: JSON_VERSION,
@@ -1035,8 +992,8 @@ impl Store {
             Err(e) => {
                 let msg = safe_error(&e);
                 c.execute(
-                    "UPDATE fetch_runs SET finished_at=?1,status='failed',error=?2 WHERE id=?3",
-                    params![Utc::now().to_rfc3339(), msg, run_id],
+                    "UPDATE fetch_runs SET finished_at=$1,status='failed',error=$2 WHERE id=$3",
+                    &[&Utc::now().to_rfc3339(), &msg, &run_id],
                 )?;
                 Ok(FetchResult {
                     schema: JSON_VERSION,
@@ -1079,17 +1036,12 @@ impl Store {
                 installed = atomic_write_verified(&path, &body, &hash)?;
                 let now = Utc::now().to_rfc3339();
                 let aid = match tx
-                    .query_row(
-                        "SELECT id FROM artifacts WHERE sha256=?1",
-                        params![hash],
-                        |r| r.get::<_, i64>(0),
-                    )
+                    .query_one("SELECT id FROM artifacts WHERE sha256=$1", &[&hash]).map(|row| row.get::<_, i64>(0))
                     .optional()?
                 {
                     Some(id) => id,
                     None => {
-                        tx.execute("INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)", params![hash, body.len() as i64, rel, media, now])?;
-                        tx.last_insert_rowid()
+                        tx.query_one("INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES ($1,$2,$3,$4,$5) RETURNING id", &[&hash, &(body.len() as i64), &rel, &media, &now])?.get::<_, i64>(0)
                     }
                 };
                 let mut count = 0usize;
@@ -1110,16 +1062,13 @@ impl Store {
                         &title,
                         entry.published.map(|d| d.to_rfc3339()).as_deref(),
                     );
-                    tx.execute("INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id,identity_key) DO NOTHING", params![source.id, identity, guid, link, title, entry.published.map(|d| d.to_rfc3339()), now])?;
+                    tx.execute("INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(source_id,identity_key) DO NOTHING", &[&source.id, &identity, &guid, &link, &title, &entry.published.map(|d| d.to_rfc3339()), &now])?;
                     let item_id: i64 = tx.query_row(
-                        "SELECT id FROM feed_items WHERE source_id=?1 AND identity_key=?2",
-                        params![source.id, identity],
-                        |r| r.get(0),
-                    )?;
-                    tx.execute("INSERT INTO provenance(fetch_run_id,artifact_id,item_id,source_url,fetched_at) VALUES (?1,?2,?3,?4,?5)", params![run, aid, item_id, source.url, now])?;
+                        "SELECT id FROM feed_items WHERE source_id=$1 AND identity_key=$2", &[&source.id, &identity]).map(|row| row.get(0))?;
+                    tx.execute("INSERT INTO provenance(fetch_run_id,artifact_id,item_id,source_url,fetched_at) VALUES ($1,$2,$3,$4,$5)", &[&run, &aid, &item_id, &source.url, &now])?;
                     count += 1;
                 }
-                tx.execute("UPDATE fetch_runs SET finished_at=?1,status='succeeded',http_status=?2,final_url=?3 WHERE id=?4", params![now, status, final_url, run])?;
+                tx.execute("UPDATE fetch_runs SET finished_at=$1,status='succeeded',http_status=$2,final_url=$3 WHERE id=$4", &[&now, &status, &final_url, &run])?;
                 let artifact = Artifact {
                     id: aid,
                     sha256: hash.clone(),
@@ -1240,9 +1189,8 @@ fn verify_cve_artifact(
         .as_deref()
         .context("CVE provenance requires an artifact digest")?;
     let (relative_path, expected_len): (String, i64) = tx
-        .query_row(
-            "SELECT a.relative_path,a.byte_len FROM artifacts a JOIN artifact_owners o ON o.artifact_id=a.id WHERE o.source_id=?1 AND o.locator=?2 AND a.sha256=?3",
-            params![reference.source_id.as_str(), reference.locator, expected],
+        .query_one("SELECT a.relative_path,a.byte_len FROM artifacts a JOIN artifact_owners o ON o.artifact_id=a.id WHERE o.source_id=$1 AND o.locator=$2 AND a.sha256=$3",
+            &[&reference.source_id.as_str(), &reference.locator, &expected],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .context("CVE provenance artifact is not owned by this source")?;
@@ -1408,17 +1356,17 @@ pub struct Migration {
     pub tables: &'static [&'static str],
 }
 
-const M1_CATALOG_FOUNDATION: &str = "CREATE TABLE sources (id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,url TEXT NOT NULL UNIQUE,user_agent TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL); CREATE TABLE fetch_runs (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),started_at TEXT NOT NULL,finished_at TEXT,status TEXT NOT NULL,http_status INTEGER,final_url TEXT,error TEXT); CREATE TABLE artifacts (id INTEGER PRIMARY KEY,sha256 TEXT NOT NULL UNIQUE,byte_len INTEGER NOT NULL,relative_path TEXT NOT NULL UNIQUE,media_type TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE feed_items (id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES sources(id),identity_key TEXT NOT NULL,guid TEXT,url TEXT,title TEXT NOT NULL,published_at TEXT,first_seen_at TEXT NOT NULL,UNIQUE(source_id,identity_key)); CREATE TABLE provenance (id INTEGER PRIMARY KEY,fetch_run_id INTEGER NOT NULL REFERENCES fetch_runs(id),artifact_id INTEGER NOT NULL REFERENCES artifacts(id),item_id INTEGER REFERENCES feed_items(id),source_url TEXT NOT NULL,fetched_at TEXT NOT NULL);";
+const M1_CATALOG_FOUNDATION: &str = "CREATE TABLE sources (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,name text NOT NULL UNIQUE,url text NOT NULL UNIQUE,user_agent text NOT NULL,enabled boolean NOT NULL DEFAULT true,created_at text NOT NULL); CREATE TABLE fetch_runs (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,source_id bigint NOT NULL REFERENCES sources(id),started_at text NOT NULL,finished_at text,status text NOT NULL,http_status bigint,final_url text,error text); CREATE TABLE artifacts (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,sha256 text NOT NULL UNIQUE,byte_len bigint NOT NULL,relative_path text NOT NULL UNIQUE,media_type text NOT NULL,created_at text NOT NULL); CREATE TABLE feed_items (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,source_id bigint NOT NULL REFERENCES sources(id),identity_key text NOT NULL,guid text,url text,title text NOT NULL,published_at text,first_seen_at text NOT NULL,UNIQUE(source_id,identity_key)); CREATE TABLE provenance (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,fetch_run_id bigint NOT NULL REFERENCES fetch_runs(id),artifact_id bigint NOT NULL REFERENCES artifacts(id),item_id bigint REFERENCES feed_items(id),source_url text NOT NULL,fetched_at text NOT NULL);";
 const M2_FEED_ITEM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);";
-const M3_CVE_INTELLIGENCE: &str = "CREATE TABLE artifact_owners (source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id TEXT PRIMARY KEY,cve_id TEXT NOT NULL,revision TEXT NOT NULL,modified_at TEXT NOT NULL,record_json TEXT NOT NULL,version_json TEXT NOT NULL,observed_at TEXT NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id TEXT PRIMARY KEY,version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id TEXT NOT NULL REFERENCES cve_versions(id),ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,retrieved_at TEXT NOT NULL,source_version TEXT,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);";
-const M4_ASSET_INVENTORY: &str = "CREATE TABLE asset_records (id TEXT PRIMARY KEY,created_at TEXT NOT NULL,asset_json TEXT NOT NULL); CREATE TABLE asset_observations (id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES asset_records(id),observed_at TEXT NOT NULL,corrects_observation_id TEXT REFERENCES asset_observations(id),observation_json TEXT NOT NULL); CREATE INDEX idx_asset_observations_asset_time ON asset_observations(asset_id,observed_at DESC,id DESC);";
+const M3_CVE_INTELLIGENCE: &str = "CREATE TABLE artifact_owners (source_id text NOT NULL,artifact_id bigint NOT NULL REFERENCES artifacts(id),locator text NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id text PRIMARY KEY,cve_id text NOT NULL,revision text NOT NULL,modified_at text NOT NULL,record_json text NOT NULL,version_json text NOT NULL,observed_at text NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id text PRIMARY KEY,version_id text NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id text NOT NULL REFERENCES cve_versions(id),ordinal bigint NOT NULL,source_id text NOT NULL,artifact_id bigint NOT NULL REFERENCES artifacts(id),locator text NOT NULL,retrieved_at text NOT NULL,source_version text,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);";
+const M4_ASSET_INVENTORY: &str = "CREATE TABLE asset_records (id text PRIMARY KEY,created_at text NOT NULL,asset_json text NOT NULL); CREATE TABLE asset_observations (id text PRIMARY KEY,asset_id text NOT NULL REFERENCES asset_records(id),observed_at text NOT NULL,corrects_observation_id text REFERENCES asset_observations(id),observation_json text NOT NULL); CREATE INDEX idx_asset_observations_asset_time ON asset_observations(asset_id,observed_at DESC,id DESC);";
 
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         name: "catalog_foundation",
         sql: M1_CATALOG_FOUNDATION,
-        checksum: "e31495b5cbd6028399518baa79f8f85a88e0a89a8a1a13b62d6f8ce3bf4b00c4",
+        checksum: "cd85c78cd10c29921ffcac1868b849debf06531f7a852e5b88208dbc69171068",
         tables: &[
             "sources",
             "fetch_runs",
@@ -1438,7 +1386,7 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "cve_intelligence",
         sql: M3_CVE_INTELLIGENCE,
-        checksum: "d3400a86e83c295378696e41612372048f40f65c4c28ae2aee1fd9ff87ee065b",
+        checksum: "91e1a000e191c32631d37f9a638954ba0ab58e845f5e43d93cd11efb441ff47c",
         tables: &[
             "artifact_owners",
             "cve_versions",
@@ -1450,7 +1398,7 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "asset_inventory",
         sql: M4_ASSET_INVENTORY,
-        checksum: "889633572fc79f050fc7ff80317def6211e2698ffd3acf95f59ebd5f1d461724",
+        checksum: "bbdab23d4663aaeb4281fa2597d1552ce31d425825e2e975315cd7830148a942",
         tables: &["asset_records", "asset_observations"],
     },
 ];
@@ -1474,10 +1422,8 @@ fn sha256_hex(value: &str) -> String {
 /// Read migration state without opening a write transaction or applying anything.
 pub fn migration_status(c: &Connection) -> Result<Vec<MigrationState>> {
     let exists: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
-        [],
-        |r| r.get(0),
-    )?;
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_name = 'schema_migrations')", []).map(|row| row.get(0))?;
     let applied: Vec<i64> = if exists {
         let mut st = c.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
         let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
@@ -1520,18 +1466,16 @@ fn migrate(c: &mut Connection) -> Result<()> {
     // lock: two first-time opens could otherwise both observe an empty ledger
     // and race while creating the migration tables.
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute_batch(
+    tx.batch_execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);",
     )?;
     // The ledger predates checksums. Add the column rather than rewriting the
     // table, so an existing catalog keeps its history.
-    let has_checksum: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('schema_migrations') WHERE name='checksum')",
-        [],
-        |r| r.get(0),
-    )?;
+    let has_checksum: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'schema_migrations' \
+           AND column_name = 'checksum')", []).map(|row| row.get(0))?;
     if !has_checksum {
-        tx.execute_batch("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT;")?;
+        tx.batch_execute("ALTER TABLE schema_migrations ADD COLUMN checksum text")?;
     }
 
     let recorded = {
@@ -1558,10 +1502,10 @@ fn migrate(c: &mut Connection) -> Result<()> {
             .iter()
             .find(|m| m.version == next)
             .expect("embedded migrations are contiguous");
-        tx.execute_batch(migration.sql)?;
+        tx.batch_execute(migration.sql)?;
         tx.execute(
-            "INSERT INTO schema_migrations(version, checksum) VALUES (?1, ?2)",
-            params![next, migration.checksum],
+            "INSERT INTO schema_migrations(version, checksum) VALUES ($1, $2)",
+            &[&next, &migration.checksum],
         )?;
         current = next;
     }
@@ -1596,11 +1540,8 @@ fn verify_recorded_migrations(
         }
         // Legacy row with no checksum: the live tables are the only evidence.
         for table in migration.tables {
-            let present: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                params![table],
-                |r| r.get(0),
-            )?;
+            let present: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = current_schema() AND table_name = $1)", &[&table]).map(|row| row.get(0))?;
             if !present {
                 bail!(
                     "schema migration {version} ('{}') is recorded but table '{table}' is missing; \
@@ -1610,8 +1551,8 @@ fn verify_recorded_migrations(
             }
         }
         tx.execute(
-            "UPDATE schema_migrations SET checksum=?2 WHERE version=?1",
-            params![version, migration.checksum],
+            "UPDATE schema_migrations SET checksum=$2 WHERE version=$1",
+            &[&version, &migration.checksum],
         )?;
     }
     Ok(())
@@ -1620,8 +1561,8 @@ fn verify_recorded_migrations(
 fn recover_stale_runs(c: &Connection) -> Result<()> {
     let cutoff = (Utc::now() - STALE_RUN_AGE).to_rfc3339();
     c.execute(
-        "UPDATE fetch_runs SET finished_at=?1,status='failed',error='fetch interrupted' WHERE status='running' AND started_at < ?2",
-        params![Utc::now().to_rfc3339(), cutoff],
+        "UPDATE fetch_runs SET finished_at=$1,status='failed',error='fetch interrupted' WHERE status='running' AND started_at < $2",
+        &[&Utc::now().to_rfc3339(), &cutoff],
     )?;
     Ok(())
 }
@@ -2311,7 +2252,7 @@ mod tests {
         let d = tempfile::tempdir()?;
         let db = d.path().join("db.sqlite");
         let c = Connection::open(&db)?;
-        c.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations(version) VALUES (2);")?;
+        c.batch_execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations(version) VALUES (2);")?;
         drop(c);
         assert!(Store::open(&db, d.path().join("artifacts")).is_err());
         Ok(())
@@ -2357,13 +2298,13 @@ mod tests {
         )?;
         let old = (Utc::now() - ChronoDuration::hours(2)).to_rfc3339();
         c.execute(
-            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES (1,?1,'running')",
-            params![old],
+            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES (1,$1,'running')",
+            &[&old],
         )?;
         let recent = (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339();
         c.execute(
-            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES (1,?1,'running')",
-            params![recent],
+            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES (1,$1,'running')",
+            &[&recent],
         )?;
         drop(c);
 
@@ -2659,9 +2600,9 @@ mod tests {
         assert!(store.ingest_cve(&record, &conflict, &[artifact]).is_err());
         let connection = store.conn()?;
         let versions: i64 =
-            connection.query_row("SELECT COUNT(*) FROM cve_versions", [], |row| row.get(0))?;
+            connection.query_one("SELECT COUNT(*) FROM cve_versions", []).map(|row| row.get(0))?;
         let provenance: i64 =
-            connection.query_row("SELECT COUNT(*) FROM cve_version_provenance", [], |row| {
+            connection.query_one("SELECT COUNT(*) FROM cve_version_provenance", [], |row| {
                 row.get(0)
             })?;
         assert_eq!(versions, 1);
@@ -2712,7 +2653,7 @@ mod tests {
                         assert!(installed_path.exists());
                         transaction.busy_timeout(Duration::ZERO)?;
                         let connection = store.conn()?;
-                        connection.execute_batch("BEGIN DEFERRED")?;
+                        connection.batch_execute("BEGIN DEFERRED")?;
                         connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
                             row.get::<_, i64>(0)
                         })?;
@@ -2766,7 +2707,7 @@ mod tests {
             store.ingest_cve_with_before_commit(&record, &version, &[artifact], |transaction| {
                 // Deterministically model a provider that committed but then
                 // reported an error to its caller.
-                transaction.execute_batch("COMMIT")?;
+                transaction.batch_execute("COMMIT")?;
                 bail!("simulated ambiguous commit result")
             })?;
 
@@ -2779,9 +2720,9 @@ mod tests {
         );
         let connection = store.conn()?;
         let versions: i64 =
-            connection.query_row("SELECT COUNT(*) FROM cve_versions", [], |row| row.get(0))?;
+            connection.query_row("SELECT COUNT(*) FROM cve_versions", []).map(|row| row.get(0))?;
         let provenance: i64 =
-            connection.query_row("SELECT COUNT(*) FROM cve_version_provenance", [], |row| {
+            connection.query_one("SELECT COUNT(*) FROM cve_version_provenance", [], |row| {
                 row.get(0)
             })?;
         assert_eq!(versions, 1);
@@ -2813,8 +2754,8 @@ mod tests {
         let relative_path = format!("sha256/{}/{digest}", &digest[..2]);
         let installed_path = store.artifact_root.join(&relative_path);
         store.conn()?.execute(
-            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)",
-            params![digest, 9_i64, relative_path, "application/json", record.modified_at.to_rfc3339()],
+            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES ($1,$2,$3,$4,$5)",
+            &[&digest, &9_i64, &relative_path, &"application/json", &record.modified_at.to_rfc3339()],
         )?;
         assert!(!installed_path.exists());
 
@@ -2823,7 +2764,7 @@ mod tests {
             .ingest_cve_with_before_commit(&record, &version, &[artifact], |transaction| {
                 transaction.busy_timeout(Duration::ZERO)?;
                 let connection = store.conn()?;
-                connection.execute_batch("BEGIN DEFERRED")?;
+                connection.batch_execute("BEGIN DEFERRED")?;
                 connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
                     row.get::<_, i64>(0)
                 })?;
@@ -2837,9 +2778,9 @@ mod tests {
         drop(read_lock.take());
         let connection = store.conn()?;
         let versions: i64 =
-            connection.query_row("SELECT COUNT(*) FROM cve_versions", [], |row| row.get(0))?;
+            connection.query_row("SELECT COUNT(*) FROM cve_versions", []).map(|row| row.get(0))?;
         let artifacts: i64 =
-            connection.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))?;
+            connection.query_one("SELECT COUNT(*) FROM artifacts", []).map(|row| row.get(0))?;
         assert_eq!(versions, 0);
         assert_eq!(artifacts, 1);
         Ok(())
@@ -2899,8 +2840,8 @@ mod tests {
                 assert!(installed_path.exists());
                 let write_error = writer
                     .execute(
-                        "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)",
-                        params![digest, 9_i64, relative_path, "application/json", record.modified_at.to_rfc3339()],
+                        "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES ($1,$2,$3,$4,$5)",
+                        &[&digest, &9_i64, &relative_path, &"application/json", &record.modified_at.to_rfc3339()],
                     )
                     .unwrap_err();
                 assert!(write_error.to_string().contains("database is locked"));
@@ -2911,14 +2852,10 @@ mod tests {
         assert_eq!(state, CveCommitState::Absent);
         assert!(!installed_path.exists());
         writer.execute(
-            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES (?1,?2,?3,?4,?5)",
-            params![digest, 9_i64, relative_path, "application/json", record.modified_at.to_rfc3339()],
+            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES ($1,$2,$3,$4,$5)",
+            &[&digest, &9_i64, &relative_path, &"application/json", &record.modified_at.to_rfc3339()],
         )?;
-        let cataloged: bool = writer.query_row(
-            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE sha256=?1)",
-            params![digest],
-            |row| row.get(0),
-        )?;
+        let cataloged: bool = writer.query_one("SELECT EXISTS(SELECT 1 FROM artifacts WHERE sha256=$1)", &[&digest]).map(|row| row.get(0))?;
         assert!(cataloged);
         Ok(())
     }

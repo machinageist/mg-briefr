@@ -92,9 +92,8 @@ impl Store {
 
             let asset_json = serde_json::to_string(&entry.asset.storage_value()?)?;
             let existing_asset = tx
-                .query_row(
-                    "SELECT asset_json FROM asset_records WHERE id=?1",
-                    params![entry.asset.id.as_str()],
+                .query_one("SELECT asset_json FROM asset_records WHERE id=$1",
+                    &[&entry.asset.id.as_str()],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
@@ -103,12 +102,8 @@ impl Store {
                 Some(_) => bail!("immutable asset conflict"),
                 None => {
                     tx.execute(
-                        "INSERT INTO asset_records(id,created_at,asset_json) VALUES (?1,?2,?3)",
-                        params![
-                            entry.asset.id.as_str(),
-                            entry.asset.created_at.to_rfc3339(),
-                            asset_json
-                        ],
+                        "INSERT INTO asset_records(id,created_at,asset_json) VALUES ($1,$2,$3)",
+                        &[&entry.asset.id.as_str(), &entry.asset.created_at.to_rfc3339(), &asset_json],
                     )?;
                     inserted_assets += 1;
                     true
@@ -117,9 +112,8 @@ impl Store {
 
             if let Some(corrected_id) = &entry.observation.corrects_observation_id {
                 let corrected = tx
-                    .query_row(
-                        "SELECT id,asset_id,observed_at,corrects_observation_id,observation_json FROM asset_observations WHERE id=?1",
-                        params![corrected_id.as_str()],
+                    .query_one("SELECT id,asset_id,observed_at,corrects_observation_id,observation_json FROM asset_observations WHERE id=$1",
+                        &[&corrected_id.as_str()],
                         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?)),
                     )
                     .optional()?
@@ -142,28 +136,19 @@ impl Store {
             let observation_json = serde_json::to_string(&entry.observation.storage_value()?)?;
             let existing_observation = tx
                 .query_row(
-                    "SELECT observation_json FROM asset_observations WHERE id=?1",
-                    params![entry.observation.id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
+                    "SELECT observation_json FROM asset_observations WHERE id=$1", &[&entry.observation.id.as_str()]).map(|row| row.get::<_, String>(0))
                 .optional()?;
             let observation_inserted = match existing_observation {
                 Some(existing) if existing == observation_json => false,
                 Some(_) => bail!("immutable asset observation conflict"),
                 None => {
                     tx.execute(
-                        "INSERT INTO asset_observations(id,asset_id,observed_at,corrects_observation_id,observation_json) VALUES (?1,?2,?3,?4,?5)",
-                        params![
-                            entry.observation.id.as_str(),
-                            entry.observation.asset_id.as_str(),
-                            entry.observation.observed_at.to_rfc3339(),
-                            entry
+                        "INSERT INTO asset_observations(id,asset_id,observed_at,corrects_observation_id,observation_json) VALUES ($1,$2,$3,$4,$5)",
+                        &[&entry.observation.id.as_str(), &entry.observation.asset_id.as_str(), &entry.observation.observed_at.to_rfc3339(), &entry
                                 .observation
                                 .corrects_observation_id
                                 .as_ref()
-                                .map(StableId::as_str),
-                            observation_json
-                        ],
+                                .map(StableId::as_str), &observation_json],
                     )?;
                     inserted_observations += 1;
                     true
@@ -188,9 +173,9 @@ impl Store {
         validate_asset_limit(limit, "asset list")?;
         let connection = self.conn()?;
         let mut statement =
-            connection.prepare("SELECT id,asset_json FROM asset_records ORDER BY id LIMIT ?1")?;
+            connection.prepare("SELECT id,asset_json FROM asset_records ORDER BY id LIMIT $1")?;
         let assets = statement
-            .query_map(params![limit as i64], |row| {
+            .query_map(&[&limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -225,8 +210,8 @@ impl Store {
         let connection = self.conn()?;
         let (stored_id, asset_json) = connection
             .query_row(
-                "SELECT id,asset_json FROM asset_records WHERE id=?1",
-                params![asset_id.as_str()],
+                "SELECT id,asset_json FROM asset_records WHERE id=$1",
+                &[&asset_id.as_str()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
@@ -255,10 +240,10 @@ fn load_recent_observations(
     limit: usize,
 ) -> Result<Vec<AssetObservation>> {
     let mut statement = connection.prepare(
-        "SELECT id,asset_id,observed_at,corrects_observation_id,observation_json FROM asset_observations WHERE asset_id=?1 ORDER BY observed_at DESC,id DESC LIMIT ?2",
+        "SELECT id,asset_id,observed_at,corrects_observation_id,observation_json FROM asset_observations WHERE asset_id=$1 ORDER BY observed_at DESC,id DESC LIMIT $2",
     )?;
     let observations = statement
-        .query_map(params![asset_id, limit as i64], |row| {
+        .query_map(&[&asset_id, &limit as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -288,8 +273,8 @@ fn load_effective_observation(
 ) -> Result<Option<AssetObservation>> {
     let stored = connection
         .query_row(
-            "SELECT id,asset_id,observed_at,corrects_observation_id,observation_json FROM asset_observations WHERE asset_id=?1 AND observed_at<=?2 ORDER BY CASE WHEN corrects_observation_id IS NOT NULL THEN 1 ELSE 0 END DESC,observed_at DESC,id DESC LIMIT 1",
-            params![asset_id, as_of.to_rfc3339()],
+            "SELECT id,asset_id,observed_at,corrects_observation_id,observation_json FROM asset_observations WHERE asset_id=$1 AND observed_at<=$2 ORDER BY CASE WHEN corrects_observation_id IS NOT NULL THEN 1 ELSE 0 END DESC,observed_at DESC,id DESC LIMIT 1",
+            &[&asset_id, &as_of.to_rfc3339()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -316,10 +301,7 @@ fn load_effective_observation(
 
 fn observation_count(connection: &rusqlite::Connection, asset_id: &str) -> Result<usize> {
     let count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM asset_observations WHERE asset_id=?1",
-        params![asset_id],
-        |row| row.get(0),
-    )?;
+        "SELECT COUNT(*) FROM asset_observations WHERE asset_id=$1", &[&asset_id]).map(|row| row.get(0))?;
     usize::try_from(count).context("invalid stored asset observation count")
 }
 
