@@ -62,3 +62,7 @@ blocked by the fetch safety policy.
 - AI-generated conclusions without cited records;
 - dashboards, alerting services, synchronization, or a broad hardware extractor;
 - a second inventory authority outside immutable asset observations.
+
+## License
+
+MIT. See `LICENSE`.
