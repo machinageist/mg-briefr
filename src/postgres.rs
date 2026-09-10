@@ -118,6 +118,13 @@ fn migration_checksum(sql: &str) -> String {
         .collect()
 }
 
+fn validate_fetch_status(status: &str) -> Result<()> {
+    if !matches!(status, "succeeded" | "failed") {
+        anyhow::bail!("fetch run status must be succeeded or failed");
+    }
+    Ok(())
+}
+
 fn validate_persisted_versions(persisted: &[i64], max_version: usize) -> Result<()> {
     for (index, version) in persisted.iter().enumerate() {
         if *version != (index as i64) + 1 || *version > max_version as i64 {
@@ -234,6 +241,35 @@ impl PostgresStore {
             .collect())
     }
 
+    pub fn start_fetch_run(&self, source_id: i64) -> Result<i64> {
+        let mut client = self.connect()?;
+        let row = client.query_one(
+            "INSERT INTO fetch_runs(source_id,started_at,status) VALUES ($1,CURRENT_TIMESTAMP,'running') RETURNING id",
+            &[&source_id],
+        )?;
+        Ok(row.get(0))
+    }
+
+    pub fn finish_fetch_run(
+        &self,
+        fetch_run_id: i64,
+        status: &str,
+        http_status: Option<i32>,
+        final_url: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        validate_fetch_status(status)?;
+        let mut client = self.connect()?;
+        let updated = client.execute(
+            "UPDATE fetch_runs SET finished_at=CURRENT_TIMESTAMP,status=$1,http_status=$2,final_url=$3,error=$4 WHERE id=$5 AND status='running'",
+            &[&status, &http_status, &final_url, &error, &fetch_run_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("fetch run is missing or already terminal");
+        }
+        Ok(())
+    }
+
     pub fn artifact_root(&self) -> &Path {
         &self.artifact_root
     }
@@ -241,7 +277,7 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_persisted_versions, MIGRATIONS};
+    use super::{validate_fetch_status, validate_persisted_versions, MIGRATIONS};
 
     #[test]
     fn postgres_migrations_are_ordered_and_use_ported_types() {
@@ -257,5 +293,8 @@ mod tests {
         assert!(validate_persisted_versions(&[1, 2, 3], 4).is_ok());
         assert!(validate_persisted_versions(&[1, 3], 4).is_err());
         assert!(validate_persisted_versions(&[1, 2, 99], 4).is_err());
+        assert!(validate_fetch_status("succeeded").is_ok());
+        assert!(validate_fetch_status("failed").is_ok());
+        assert!(validate_fetch_status("running").is_err());
     }
 }
