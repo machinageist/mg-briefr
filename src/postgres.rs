@@ -293,7 +293,7 @@ impl PostgresStore {
     pub fn upsert_feed_item(&self, item: FeedItemInput<'_>) -> Result<i64> {
         let mut client = self.connect()?;
         let row = client.query_one(
-            "INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at) VALUES ($1,$2,$3,$4,$5,CAST($6 AS TIMESTAMPTZ),CURRENT_TIMESTAMP) ON CONFLICT(source_id,identity_key) DO UPDATE SET guid=EXCLUDED.guid,url=EXCLUDED.url,title=EXCLUDED.title,published_at=EXCLUDED.published_at RETURNING id",
+            "INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at) VALUES ($1,$2,$3,$4,$5,NULLIF($6::text,'')::TIMESTAMPTZ,CURRENT_TIMESTAMP) ON CONFLICT(source_id,identity_key) DO UPDATE SET guid=EXCLUDED.guid,url=EXCLUDED.url,title=EXCLUDED.title,published_at=EXCLUDED.published_at RETURNING id",
             &[&item.source_id, &item.identity_key, &item.guid, &item.url, &item.title, &item.published_at],
         )?;
         Ok(row.get(0))
