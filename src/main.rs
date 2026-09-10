@@ -24,6 +24,8 @@ const MAX_ASSET_IMPORT_BYTES: u64 = 16 * 1024 * 1024;
 struct Cli {
     #[arg(long, env = "MG_BRIEF_DB")]
     db: Option<PathBuf>,
+    #[arg(long, env = "MG_BRIEF_DATABASE_URL")]
+    database_url: Option<String>,
     #[arg(long, env = "MG_BRIEF_ARTIFACT_ROOT")]
     artifact_root: Option<PathBuf>,
     #[command(subcommand)]
@@ -192,6 +194,32 @@ fn main() -> Result<()> {
             mg_brief::migration_status(&rusqlite::Connection::open_in_memory()?)?
         };
         println!("{}", to_string_pretty(&states)?);
+        return Ok(());
+    }
+    if let Some(database_url) = cli.database_url.as_deref() {
+        if !matches!(cli.command, Command::Register { .. } | Command::Sources) {
+            anyhow::bail!(
+                "the PostgreSQL catalog currently supports only register and sources; use --db for this command"
+            );
+        }
+        let pg = mg_brief::postgres::PostgresStore::open(
+            database_url,
+            cli.artifact_root.clone().unwrap_or(root.clone()),
+        )?;
+        match &cli.command {
+            Command::Register {
+                name,
+                url,
+                user_agent,
+            } => println!(
+                "{}",
+                to_string_pretty(&pg.register(name, url, user_agent.as_deref())?)?
+            ),
+            Command::Sources => println!("{}", to_string_pretty(&pg.list_sources()?)?),
+            _ => anyhow::bail!(
+                "the PostgreSQL catalog currently supports only register and sources; use --db for this command"
+            ),
+        }
         return Ok(());
     }
     let store = Store::open(cli.db.unwrap_or(db), cli.artifact_root.unwrap_or(root))?;
