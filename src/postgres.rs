@@ -12,6 +12,17 @@ pub struct PostgresStore {
     pub artifact_root: PathBuf,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostgresFeedItem {
+    pub id: i64,
+    pub source_id: i64,
+    pub identity_key: String,
+    pub guid: Option<String>,
+    pub url: Option<String>,
+    pub title: String,
+    pub published_at: Option<String>,
+    pub first_seen_at: String,
+}
 #[derive(Debug, Clone)]
 pub struct FeedItemInput<'a> {
     pub source_id: i64,
@@ -286,6 +297,41 @@ impl PostgresStore {
             &[&item.source_id, &item.identity_key, &item.guid, &item.url, &item.title, &item.published_at],
         )?;
         Ok(row.get(0))
+    }
+
+    pub fn list_feed_items(
+        &self,
+        source_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<PostgresFeedItem>> {
+        if !(1..=10_000).contains(&limit) {
+            anyhow::bail!("feed item limit must be between 1 and 10000");
+        }
+        let mut client = self.connect()?;
+        let rows = if let Some(source_id) = source_id {
+            client.query(
+                "SELECT id,source_id,identity_key,guid,url,title,published_at::TEXT,first_seen_at::TEXT FROM feed_items WHERE source_id=$1 ORDER BY source_id,identity_key LIMIT $2",
+                &[&source_id, &limit],
+            )?
+        } else {
+            client.query(
+                "SELECT id,source_id,identity_key,guid,url,title,published_at::TEXT,first_seen_at::TEXT FROM feed_items ORDER BY source_id,identity_key LIMIT $1",
+                &[&limit],
+            )?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|row| PostgresFeedItem {
+                id: row.get(0),
+                source_id: row.get(1),
+                identity_key: row.get(2),
+                guid: row.get(3),
+                url: row.get(4),
+                title: row.get(5),
+                published_at: row.get(6),
+                first_seen_at: row.get(7),
+            })
+            .collect())
     }
 
     pub fn record_provenance(
