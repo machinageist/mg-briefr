@@ -188,6 +188,52 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub fn register(
+        &self,
+        name: &str,
+        source_url: &str,
+        user_agent: Option<&str>,
+    ) -> Result<crate::Source> {
+        let parsed = crate::validate_url(source_url)?;
+        if parsed.scheme() == "file" {
+            anyhow::bail!("file sources require trusted fixture mode");
+        }
+        let ua = user_agent.unwrap_or(crate::DEFAULT_USER_AGENT);
+        if ua.contains(['\r', '\n']) || ua.len() > 512 {
+            anyhow::bail!("user-agent is invalid");
+        }
+        let mut client = self.connect()?;
+        let row = client.query_one(
+            "INSERT INTO sources(name,url,user_agent,created_at) VALUES ($1,$2,$3,CURRENT_TIMESTAMP) ON CONFLICT(name) DO UPDATE SET url=EXCLUDED.url,user_agent=EXCLUDED.user_agent,enabled=TRUE RETURNING id,name,url,user_agent,enabled",
+            &[&name, &parsed.as_str(), &ua],
+        )?;
+        Ok(crate::Source {
+            id: row.get(0),
+            name: row.get(1),
+            url: row.get(2),
+            user_agent: row.get(3),
+            enabled: row.get(4),
+        })
+    }
+
+    pub fn list_sources(&self) -> Result<Vec<crate::Source>> {
+        let mut client = self.connect()?;
+        let rows = client.query(
+            "SELECT id,name,url,user_agent,enabled FROM sources ORDER BY id",
+            &[],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::Source {
+                id: row.get(0),
+                name: row.get(1),
+                url: row.get(2),
+                user_agent: row.get(3),
+                enabled: row.get(4),
+            })
+            .collect())
+    }
+
     pub fn artifact_root(&self) -> &Path {
         &self.artifact_root
     }
