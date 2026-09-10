@@ -303,6 +303,38 @@ impl PostgresStore {
         Ok(row.get(0))
     }
 
+    pub fn upsert_artifact(
+        &self,
+        sha256: &str,
+        byte_len: i64,
+        relative_path: &str,
+        media_type: &str,
+    ) -> Result<i64> {
+        if byte_len < 0 {
+            anyhow::bail!("artifact byte length must be non-negative");
+        }
+        crate::safe_relative_path(relative_path)?;
+        let mut client = self.connect()?;
+        client.execute(
+            "INSERT INTO artifacts(sha256,byte_len,relative_path,media_type,created_at) VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP) ON CONFLICT(sha256) DO NOTHING",
+            &[&sha256, &byte_len, &relative_path, &media_type],
+        )?;
+        let existing = client.query_one(
+            "SELECT id,byte_len,relative_path,media_type FROM artifacts WHERE sha256=$1",
+            &[&sha256],
+        )?;
+        let existing_len: i64 = existing.get(1);
+        let existing_path: String = existing.get(2);
+        let existing_media: String = existing.get(3);
+        if existing_len != byte_len
+            || existing_path != relative_path
+            || existing_media != media_type
+        {
+            anyhow::bail!("artifact identity conflicts with existing metadata");
+        }
+        Ok(existing.get(0))
+    }
+
     pub fn artifact_root(&self) -> &Path {
         &self.artifact_root
     }
