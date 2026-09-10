@@ -1,0 +1,215 @@
+use anyhow::{Context, Result};
+use postgres::{Client, NoTls};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone)]
+pub struct PostgresStore {
+    pub database_url: String,
+    pub artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub version: i64,
+    pub name: &'static str,
+    pub sql: &'static str,
+}
+
+const M1: &str = r#"
+CREATE TABLE sources (
+ id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ name TEXT NOT NULL UNIQUE, url TEXT NOT NULL UNIQUE,
+ user_agent TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT TRUE,
+ created_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE fetch_runs (
+ id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ source_id BIGINT NOT NULL REFERENCES sources(id), started_at TIMESTAMPTZ NOT NULL,
+ finished_at TIMESTAMPTZ, status TEXT NOT NULL, http_status INTEGER,
+ final_url TEXT, error TEXT
+);
+CREATE TABLE artifacts (
+ id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ sha256 TEXT NOT NULL UNIQUE, byte_len BIGINT NOT NULL,
+ relative_path TEXT NOT NULL UNIQUE, media_type TEXT NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE feed_items (
+ id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ source_id BIGINT NOT NULL REFERENCES sources(id), identity_key TEXT NOT NULL,
+ guid TEXT, url TEXT, title TEXT NOT NULL, published_at TIMESTAMPTZ,
+ first_seen_at TIMESTAMPTZ NOT NULL, UNIQUE(source_id, identity_key)
+);
+CREATE TABLE provenance (
+ id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ fetch_run_id BIGINT NOT NULL REFERENCES fetch_runs(id),
+ artifact_id BIGINT NOT NULL REFERENCES artifacts(id),
+ item_id BIGINT REFERENCES feed_items(id), source_url TEXT NOT NULL,
+ fetched_at TIMESTAMPTZ NOT NULL
+);
+"#;
+const M2: &str = "CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);";
+const M3: &str = r#"
+CREATE TABLE artifact_owners (
+ source_id TEXT NOT NULL, artifact_id BIGINT NOT NULL REFERENCES artifacts(id),
+ locator TEXT NOT NULL, PRIMARY KEY(source_id, artifact_id, locator)
+);
+CREATE TABLE cve_versions (
+ id TEXT PRIMARY KEY, cve_id TEXT NOT NULL, revision TEXT NOT NULL,
+ modified_at TIMESTAMPTZ NOT NULL, record_json JSONB NOT NULL,
+ version_json JSONB NOT NULL, observed_at TIMESTAMPTZ NOT NULL,
+ UNIQUE(cve_id, revision)
+);
+CREATE TABLE cve_current (
+ cve_id TEXT PRIMARY KEY, version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)
+);
+CREATE TABLE cve_version_provenance (
+ version_id TEXT NOT NULL REFERENCES cve_versions(id), ordinal INTEGER NOT NULL,
+ source_id TEXT NOT NULL, artifact_id BIGINT NOT NULL REFERENCES artifacts(id),
+ locator TEXT NOT NULL, retrieved_at TIMESTAMPTZ NOT NULL, source_version TEXT,
+ PRIMARY KEY(version_id, ordinal)
+);
+CREATE INDEX idx_cve_history ON cve_versions(cve_id, modified_at DESC, id DESC);
+"#;
+const M4: &str = r#"
+CREATE TABLE asset_records (
+ id TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, asset_json JSONB NOT NULL
+);
+CREATE TABLE asset_observations (
+ id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES asset_records(id),
+ observed_at TIMESTAMPTZ NOT NULL, corrects_observation_id TEXT REFERENCES asset_observations(id),
+ observation_json JSONB NOT NULL
+);
+CREATE INDEX idx_asset_observations_asset_time
+ ON asset_observations(asset_id, observed_at DESC, id DESC);
+"#;
+
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "catalog_foundation",
+        sql: M1,
+    },
+    Migration {
+        version: 2,
+        name: "feed_item_index",
+        sql: M2,
+    },
+    Migration {
+        version: 3,
+        name: "cve_intelligence",
+        sql: M3,
+    },
+    Migration {
+        version: 4,
+        name: "asset_inventory",
+        sql: M4,
+    },
+];
+
+fn migration_checksum(sql: &str) -> String {
+    Sha256::digest(sql.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_persisted_versions(persisted: &[i64], max_version: usize) -> Result<()> {
+    for (index, version) in persisted.iter().enumerate() {
+        if *version != (index as i64) + 1 || *version > max_version as i64 {
+            anyhow::bail!("PostgreSQL migration ledger has a gap or unknown version");
+        }
+    }
+    Ok(())
+}
+
+impl PostgresStore {
+    pub fn open(
+        database_url: impl Into<String>,
+        artifact_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let artifact_root = artifact_root.into();
+        fs::create_dir_all(&artifact_root).context("create artifact root")?;
+        let store = Self {
+            database_url: database_url.into(),
+            artifact_root,
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn connect(&self) -> Result<Client> {
+        Client::connect(&self.database_url, NoTls).context("connect to PostgreSQL catalog")
+    }
+
+    pub fn migrate(&self) -> Result<()> {
+        let mut client = self.connect()?;
+        let mut tx = client.transaction().context("begin catalog migration")?;
+        tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&6_851_863_988_i64])?;
+        tx.batch_execute("CREATE TABLE IF NOT EXISTS mg_brief_schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL)")?;
+        let persisted: Vec<i64> = tx
+            .query(
+                "SELECT version FROM mg_brief_schema_migrations ORDER BY version",
+                &[],
+            )?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        validate_persisted_versions(&persisted, MIGRATIONS.len())?;
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            if migration.version != (index as i64) + 1 {
+                anyhow::bail!("PostgreSQL migrations are not contiguous");
+            }
+            let checksum = migration_checksum(migration.sql);
+            let applied = tx.query_opt(
+                "SELECT name, checksum FROM mg_brief_schema_migrations WHERE version=$1",
+                &[&migration.version],
+            )?;
+            if let Some(row) = applied {
+                let name: String = row.get(0);
+                let applied_checksum: String = row.get(1);
+                if name != migration.name || applied_checksum != checksum {
+                    anyhow::bail!("migration {} checksum or name mismatch", migration.version);
+                }
+                continue;
+            }
+            tx.batch_execute(migration.sql)
+                .with_context(|| format!("apply PostgreSQL migration {}", migration.version))?;
+            tx.execute(
+                "INSERT INTO mg_brief_schema_migrations(version,name,checksum) VALUES ($1,$2,$3)",
+                &[&migration.version, &migration.name, &checksum],
+            )?;
+        }
+        tx.commit().context("commit catalog migration")?;
+        Ok(())
+    }
+
+    pub fn artifact_root(&self) -> &Path {
+        &self.artifact_root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_persisted_versions, MIGRATIONS};
+
+    #[test]
+    fn postgres_migrations_are_ordered_and_use_ported_types() {
+        assert_eq!(
+            MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(MIGRATIONS[0]
+            .sql
+            .contains("BIGINT GENERATED ALWAYS AS IDENTITY"));
+        assert!(MIGRATIONS[0].sql.contains("enabled BOOLEAN"));
+        assert!(MIGRATIONS[2].sql.contains("JSONB"));
+        assert!(validate_persisted_versions(&[1, 2, 3], 4).is_ok());
+        assert!(validate_persisted_versions(&[1, 3], 4).is_err());
+        assert!(validate_persisted_versions(&[1, 2, 99], 4).is_err());
+    }
+}

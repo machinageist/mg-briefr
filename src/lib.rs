@@ -1,5 +1,6 @@
 pub mod asset;
 pub mod cve;
+pub mod postgres;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
