@@ -12,6 +12,15 @@ pub struct PostgresStore {
     pub artifact_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct FeedItemInput<'a> {
+    pub source_id: i64,
+    pub identity_key: &'a str,
+    pub guid: Option<&'a str>,
+    pub url: Option<&'a str>,
+    pub title: &'a str,
+    pub published_at: Option<&'a str>,
+}
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
     pub version: i64,
@@ -268,6 +277,30 @@ impl PostgresStore {
             anyhow::bail!("fetch run is missing or already terminal");
         }
         Ok(())
+    }
+
+    pub fn upsert_feed_item(&self, item: FeedItemInput<'_>) -> Result<i64> {
+        let mut client = self.connect()?;
+        let row = client.query_one(
+            "INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at) VALUES ($1,$2,$3,$4,$5,CAST($6 AS TIMESTAMPTZ),CURRENT_TIMESTAMP) ON CONFLICT(source_id,identity_key) DO UPDATE SET guid=EXCLUDED.guid,url=EXCLUDED.url,title=EXCLUDED.title,published_at=EXCLUDED.published_at RETURNING id",
+            &[&item.source_id, &item.identity_key, &item.guid, &item.url, &item.title, &item.published_at],
+        )?;
+        Ok(row.get(0))
+    }
+
+    pub fn record_provenance(
+        &self,
+        fetch_run_id: i64,
+        artifact_id: i64,
+        item_id: Option<i64>,
+        source_url: &str,
+    ) -> Result<i64> {
+        let mut client = self.connect()?;
+        let row = client.query_one(
+            "INSERT INTO provenance(fetch_run_id,artifact_id,item_id,source_url,fetched_at) VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP) RETURNING id",
+            &[&fetch_run_id, &artifact_id, &item_id, &source_url],
+        )?;
+        Ok(row.get(0))
     }
 
     pub fn artifact_root(&self) -> &Path {
