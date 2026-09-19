@@ -1359,6 +1359,62 @@ pub fn default_paths() -> (PathBuf, PathBuf) {
     )
 }
 
+/// Download one http(s) file through the guarded network path, streaming it to `dest`.
+///
+/// The same checks as feeds (no private or loopback targets, pinned DNS, no proxy, at most
+/// five redirects) plus a byte cap. It writes to a hidden `.<name>.part` beside `dest` and
+/// renames only once the whole file arrived under the cap, so a failed or cut-off download
+/// never leaves a half file under the real name. Returns the bytes written. For mg-streamr's
+/// podcast episodes and artwork.
+pub fn download_url(
+    url: &str,
+    user_agent: Option<&str>,
+    dest: &Path,
+    max_bytes: u64,
+    timeout_secs: u64,
+) -> Result<u64> {
+    if max_bytes == 0 || timeout_secs == 0 {
+        bail!("maximum bytes and timeout must be above zero")
+    }
+    let ua = user_agent.unwrap_or(DEFAULT_USER_AGENT);
+    if ua.contains('\r') || ua.contains('\n') || ua.len() > 512 {
+        bail!("user-agent is invalid")
+    }
+    let u = validate_url(url)?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        bail!("only http(s) downloads are allowed")
+    }
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("download destination needs a file name")?;
+    let part = dest.with_file_name(format!(".{name}.part"));
+    let (r, _) = guarded_get(u, ua, timeout_secs, reqwest::header::HeaderMap::new())?;
+    let mut r = r.error_for_status()?;
+    if r.content_length().is_some_and(|n| n > max_bytes) {
+        bail!("download exceeds configured maximum")
+    }
+    let written = (|| -> Result<u64> {
+        let mut file = fs::File::create(&part)?;
+        let written = std::io::copy(&mut (&mut r).take(max_bytes + 1), &mut file)?;
+        if written > max_bytes {
+            bail!("download exceeds configured maximum")
+        }
+        file.sync_all()?;
+        Ok(written)
+    })();
+    match written {
+        Ok(n) => {
+            fs::rename(&part, dest)?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
 /// Fetch and parse any http(s) feed through the same guarded path as sources, storing nothing.
 ///
 /// For consumers that keep their own data (mg-streamr's podcasts): SSRF checks, pinned DNS,
@@ -2572,6 +2628,26 @@ mod tests {
         let kept = response_validators(&headers);
         assert_eq!(kept.etag.as_deref(), Some("W/\"abc\""));
         assert_eq!(kept.last_modified, None, "an oversized value is noise");
+    }
+
+    #[test]
+    fn downloads_refuse_files_private_targets_and_bad_limits_without_leaving_a_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("ep.mp3");
+        for (url, max) in [
+            ("file:///etc/passwd", 1024),
+            ("http://127.0.0.1/ep.mp3", 1024),
+            ("http://10.0.0.5/ep.mp3", 1024),
+            ("http://[::1]/ep.mp3", 1024),
+            ("https://example.com/ep.mp3", 0),
+        ] {
+            assert!(download_url(url, None, &dest, max, 5).is_err(), "{url}");
+        }
+        assert!(download_url("https://example.com/ep.mp3", Some("a\nb"), &dest, 1024, 5).is_err());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "nothing written"
+        );
     }
 
     #[test]
