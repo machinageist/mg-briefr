@@ -61,7 +61,19 @@ pub struct ParsedFeed {
 // Parse RSS, Atom or JSON Feed bytes into plain entries
 pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
     let fixed = fix_minute_durations(bytes);
-    let feed = parser::parse(fixed.as_ref()).context("parse RSS/Atom feed")?;
+    // feed-rs's own id rule (a hash of link + title), except that with no link it would invent
+    // a random id — new on every fetch, so the same item would be stored again each time.
+    // Give no id instead; the caller then falls back to something stable
+    let feed = parser::Builder::new()
+        .id_generator(|links, title, uri| {
+            if links.is_empty() && (uri.is_none() || title.is_none()) {
+                return String::new();
+            }
+            parser::generate_id(links, title, uri)
+        })
+        .build()
+        .parse(fixed.as_ref())
+        .context("parse RSS/Atom feed")?;
     // a channel's artwork: the podcast cover (iTunes image / logo), else its icon
     let image_url = feed
         .logo
@@ -418,6 +430,24 @@ mod tests {
             plain_text("<script>x</script>", 10),
             "x",
             "only tags go; text inside stays"
+        );
+    }
+
+    #[test]
+    fn an_item_without_guid_or_link_gets_no_invented_id() {
+        let feed = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>S</title>
+<item><title>Bare</title><enclosure url="https://c.example/e.mp3" type="audio/mpeg" length="1"/></item>
+<item><title>Linked</title><link>https://e.example/a</link></item></channel></rss>"#;
+        let once = parse_feed(feed.as_bytes()).unwrap();
+        let twice = parse_feed(feed.as_bytes()).unwrap();
+        assert_eq!(
+            once.entries[0].guid, None,
+            "no random id for an item with nothing to hash"
+        );
+        assert!(once.entries[1].guid.is_some());
+        assert_eq!(
+            once.entries[1].guid, twice.entries[1].guid,
+            "a linked item's id is stable"
         );
     }
 
