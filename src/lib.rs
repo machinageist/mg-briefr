@@ -1342,6 +1342,22 @@ enum FetchOutcome {
     NotModified,
 }
 
+/// Where the catalog and artifacts live: `MG_BRIEF_DB` / `MG_BRIEF_ARTIFACT_ROOT`, else the
+/// XDG data and config folders. The CLI and every linked app (mg-feedr, mg-streamr) use this,
+/// so they always open the same catalog.
+pub fn default_paths() -> (PathBuf, PathBuf) {
+    let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    let config = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    (
+        std::env::var_os("MG_BRIEF_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data.join("mg-brief/catalog.sqlite")),
+        std::env::var_os("MG_BRIEF_ARTIFACT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.join("mg-brief/artifacts")),
+    )
+}
+
 /// Fetch and parse any http(s) feed through the same guarded path as sources, storing nothing.
 ///
 /// For consumers that keep their own data (mg-streamr's podcasts): SSRF checks, pinned DNS,

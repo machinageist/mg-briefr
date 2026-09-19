@@ -7,7 +7,6 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::to_string_pretty;
 use std::{
-    env,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -142,19 +141,6 @@ struct CveIngestDocument {
     version: CveVersion,
     artifacts: Vec<CveArtifactInput>,
 }
-fn defaults() -> (PathBuf, PathBuf) {
-    let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let config = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    (
-        env::var_os("MG_BRIEF_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data.join("mg-brief/catalog.sqlite")),
-        env::var_os("MG_BRIEF_ARTIFACT_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.join("mg-brief/artifacts")),
-    )
-}
-
 fn status(db: &Path) -> serde_json::Value {
     if !db.is_file() {
         return serde_json::json!({
@@ -200,7 +186,7 @@ fn status(db: &Path) -> serde_json::Value {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (db, root) = defaults();
+    let (db, root) = mg_brief::default_paths();
     if matches!(cli.command, Command::Status) {
         println!("{}", to_string_pretty(&status(&cli.db.unwrap_or(db)))?);
         return Ok(());
