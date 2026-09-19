@@ -27,6 +27,29 @@ A failed fetch is a recorded failed run, not an implicit fallback.
 `mg.brief.status/1` with catalog counts. A missing or unreadable catalog is reported as an
 explicit unconfigured/unavailable state rather than creating files.
 
+### Ticker and items
+
+mg-feedr (the live headline ticker) and mg-streamr (podcasts) link this crate rather than
+fetching feeds themselves, so every feed goes through the same guarded network path.
+
+```text
+cargo run -- register wire https://example.invalid/wire.xml --ticker --every 120
+cargo run -- ticker wire off            # or: ticker wire on --every 300 (30–86400 s)
+cargo run -- items --ticker --limit 20  # newest 20, oldest first
+cargo run -- items --since 412          # only items after id 412
+```
+
+Fetches are conditional: the stored `ETag` / `Last-Modified` go back to the server, and a 304
+records a `not_modified` run and stores nothing. Every attempt, failed or not, counts toward a
+ticker source's interval. Items carry a plain-text summary (at most 400 characters), the
+enclosure, artwork, and a `has_video` flag (a `video/*` type, or a YouTube, Vimeo,
+Dailymotion or Twitch link). Item and enclosure links are handed out only when they are
+`http`/`https`, with embedded credentials removed and the query kept.
+
+The library adds `set_ticker`, `due_ticker_sources`, `items` (an id cursor, oldest first),
+`feed::parse_feed` (pure), and `fetch_feed_url`, a bounded fetch and parse of any http(s) feed
+that stores nothing. The catalog runs in WAL mode, so a daemon and the CLI can share it.
+
 CVE and asset commands are available under `cve` and `asset`:
 
 ```text

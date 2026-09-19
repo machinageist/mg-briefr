@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use mg_brief::cve::{adapt_cve_json5, CveRecord, CveVersion, StableId};
-use mg_brief::{asset::AssetImportDocument, CveArtifactInput, Store};
+use mg_brief::{asset::AssetImportDocument, CveArtifactInput, ItemQuery, Store};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::to_string_pretty;
@@ -36,6 +36,33 @@ enum Command {
         url: String,
         #[arg(long)]
         user_agent: Option<String>,
+        /// Also show this source on the live ticker (mg-feedr)
+        #[arg(long)]
+        ticker: bool,
+        /// Seconds between ticker checks (30–86400; default 300)
+        #[arg(long, requires = "ticker")]
+        every: Option<i64>,
+    },
+    /// Show or hide a source on the live ticker
+    Ticker {
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        /// Seconds between ticker checks (30–86400)
+        #[arg(long)]
+        every: Option<i64>,
+    },
+    /// Stored headlines, oldest first; pass the last id back as --since to get only newer ones
+    Items {
+        #[arg(long)]
+        since: Option<i64>,
+        /// Only sources on the ticker
+        #[arg(long)]
+        ticker: bool,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     Sources,
     Fetch {
@@ -200,9 +227,32 @@ fn main() -> Result<()> {
             name,
             url,
             user_agent,
+            ticker,
+            every,
+        } => {
+            let mut source = store.register(&name, &url, user_agent.as_deref())?;
+            if ticker {
+                source = store.set_ticker(&name, true, every)?;
+            }
+            println!("{}", to_string_pretty(&source)?)
+        }
+        Command::Ticker { name, state, every } => println!(
+            "{}",
+            to_string_pretty(&store.set_ticker(&name, state == "on", every)?)?
+        ),
+        Command::Items {
+            since,
+            ticker,
+            source,
+            limit,
         } => println!(
             "{}",
-            to_string_pretty(&store.register(&name, &url, user_agent.as_deref())?)?
+            to_string_pretty(&store.items(&ItemQuery {
+                since,
+                ticker_only: ticker,
+                source,
+                limit,
+            })?)?
         ),
         Command::Sources => println!("{}", to_string_pretty(&store.list_sources()?)?),
         Command::Fetch {
