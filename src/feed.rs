@@ -102,13 +102,15 @@ fn fix_minute_durations(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
             .position(|b| *b == b'<')
             .map_or(bytes.len(), |p| value_start + p);
         let value = &bytes[value_start..value_end];
-        // the hours go right before the digits, after any leading spaces
-        let lead = value.len() - value.trim_ascii_start().len();
-        out.extend_from_slice(&bytes[done..value_start + lead]);
-        if is_minutes_seconds(value.trim_ascii()) {
-            out.extend_from_slice(b"0:");
+        out.extend_from_slice(&bytes[done..value_start]);
+        // feed-rs wants exactly H:MM:SS, so write that out in full ("5:07" → "0:05:07",
+        // "120:00" → "2:00:00") rather than just prefixing hours
+        match minutes_seconds(value.trim_ascii()) {
+            Some((minutes, seconds)) => out.extend_from_slice(
+                format!("{}:{:02}:{seconds:02}", minutes / 60, minutes % 60).as_bytes(),
+            ),
+            None => out.extend_from_slice(value),
         }
-        out.extend_from_slice(&value[lead..]);
         done = value_end;
         next = find(bytes, value_end);
     }
@@ -116,15 +118,18 @@ fn fix_minute_durations(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Owned(out)
 }
 
-// "30:00" or "5:07": 1–3 digits of minutes, a colon, exactly 2 digits of seconds
-fn is_minutes_seconds(text: &[u8]) -> bool {
-    let Some(colon) = text.iter().position(|b| *b == b':') else {
-        return false;
-    };
+// "30:00" or "5:07" → (minutes, seconds): 1–3 digits, a colon, exactly 2 digits; else None
+fn minutes_seconds(text: &[u8]) -> Option<(u32, u32)> {
+    let colon = text.iter().position(|b| *b == b':')?;
     let (minutes, seconds) = (&text[..colon], &text[colon + 1..]);
-    (1..=3).contains(&minutes.len())
-        && seconds.len() == 2
-        && minutes.iter().chain(seconds).all(u8::is_ascii_digit)
+    if !(1..=3).contains(&minutes.len())
+        || seconds.len() != 2
+        || !minutes.iter().chain(seconds).all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let number = |digits: &[u8]| std::str::from_utf8(digits).ok()?.parse::<u32>().ok();
+    Some((number(minutes)?, number(seconds)?))
 }
 
 // One feed-rs entry → the fields the suite uses
@@ -432,11 +437,10 @@ mod tests {
         assert_eq!(seconds(" 5:07 "), Some(307));
         assert_eq!(seconds("01:02:03"), Some(3723), "H:MM:SS unchanged");
         assert_eq!(seconds("1800"), Some(1800), "plain seconds unchanged");
-        assert!(
-            is_minutes_seconds(b"90:00")
-                && !is_minutes_seconds(b"1:02:03")
-                && !is_minutes_seconds(b"30:0")
-        );
+        assert_eq!(seconds("120:00"), Some(7200), "over an hour of minutes");
+        assert_eq!(minutes_seconds(b"90:00"), Some((90, 0)));
+        assert_eq!(minutes_seconds(b"1:02:03"), None);
+        assert_eq!(minutes_seconds(b"30:0"), None);
     }
 
     #[test]
