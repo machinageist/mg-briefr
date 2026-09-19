@@ -1977,7 +1977,7 @@ fn read_source(
     file_root: Option<&Path>,
     validators: Option<&Validators>,
 ) -> Result<Fetched> {
-    let mut u = validate_url(source)?;
+    let u = validate_url(source)?;
     if u.scheme() == "file" {
         let root = file_root.context("file sources require trusted fixture mode")?;
         let p = u
@@ -1993,6 +1993,33 @@ fn read_source(
         });
     }
     let conditional = validators.map(conditional_headers).unwrap_or_default();
+    let (r, u) = guarded_get(u, ua, timeout, conditional)?;
+    if r.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(Fetched::NotModified {
+            final_url: redact_url(u.as_str()),
+        });
+    }
+    let validators = response_validators(r.headers());
+    let (body, status, final_url, media) = read_response(r, max, redact_url(u.as_str()))?;
+    Ok(Fetched::Body {
+        body,
+        status,
+        final_url,
+        media,
+        validators,
+    })
+}
+
+// GET an http(s) URL through every guard, following at most MAX_REDIRECTS redirects itself:
+// each hop's host is checked (no private, loopback or link-local addresses) and the request is
+// pinned to the checked address, with no proxy, so a later DNS answer cannot change the
+// decision. Returns the first non-redirect response and the URL it came from
+fn guarded_get(
+    mut u: Url,
+    ua: &str,
+    timeout: u64,
+    headers: reqwest::header::HeaderMap,
+) -> Result<(Response, Url)> {
     for _ in 0..=MAX_REDIRECTS {
         let address = validate_network_target(&u)?;
         let client = Client::builder()
@@ -2008,13 +2035,8 @@ fn read_source(
                 address,
             )
             .build()?;
-        let r = client.get(u.clone()).headers(conditional.clone()).send()?;
-        if r.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(Fetched::NotModified {
-                final_url: redact_url(u.as_str()),
-            });
-        }
-        if r.status().is_redirection() {
+        let r = client.get(u.clone()).headers(headers.clone()).send()?;
+        if r.status().is_redirection() && r.status() != reqwest::StatusCode::NOT_MODIFIED {
             let location = r
                 .headers()
                 .get(reqwest::header::LOCATION)
@@ -2027,15 +2049,7 @@ fn read_source(
             }
             continue;
         }
-        let validators = response_validators(r.headers());
-        let (body, status, final_url, media) = read_response(r, max, redact_url(u.as_str()))?;
-        return Ok(Fetched::Body {
-            body,
-            status,
-            final_url,
-            media,
-            validators,
-        });
+        return Ok((r, u));
     }
     bail!("too many redirects")
 }
