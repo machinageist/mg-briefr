@@ -1,5 +1,6 @@
 pub mod asset;
 pub mod cve;
+pub mod feed;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
