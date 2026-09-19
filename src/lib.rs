@@ -3,9 +3,8 @@ pub mod cve;
 pub mod feed;
 
 use anyhow::{bail, Context, Result};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cve::{CveRecord, CveVersion, SourceReference, StableId, StorageLocator};
-use feed_rs::parser;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -29,6 +28,10 @@ const DEFAULT_USER_AGENT: &str = "mg-brief/0.1 (+local research client)";
 // A recently-started run may belong to another active process. Only runs
 // older than this are considered abandoned during startup recovery.
 const STALE_RUN_AGE: ChronoDuration = ChronoDuration::hours(1);
+// the ticker asks a source at most every 30 s and at least once a day
+const MIN_TICKER_INTERVAL: i64 = 30;
+const MAX_TICKER_INTERVAL: i64 = 86_400;
+const MAX_ITEMS: usize = 1000;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -44,18 +47,64 @@ pub struct Source {
     pub url: String,
     pub user_agent: String,
     pub enabled: bool,
+    // shown on the live ticker (mg-feedr)
+    pub ticker: bool,
+    // how often the ticker may ask this source again
+    pub fetch_interval_seconds: i64,
+    // last attempt, successful or not, RFC 3339
+    pub last_fetched_at: Option<String>,
+    // what the server said last time, sent back so an unchanged feed costs one 304
+    pub validators: Validators,
 }
 
 impl Serialize for Source {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut out = serializer.serialize_struct("Source", 5)?;
+        let mut out = serializer.serialize_struct("Source", 8)?;
         out.serialize_field("id", &self.id)?;
         out.serialize_field("name", &self.name)?;
         out.serialize_field("url", &redact_url(&self.url))?;
         out.serialize_field("user_agent", &"<redacted>")?;
         out.serialize_field("enabled", &self.enabled)?;
+        out.serialize_field("ticker", &self.ticker)?;
+        out.serialize_field("fetch_interval_seconds", &self.fetch_interval_seconds)?;
+        out.serialize_field("last_fetched_at", &self.last_fetched_at)?;
         out.end()
     }
+}
+
+/// HTTP cache validators from the last successful fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// One stored headline, as the ticker and `mg-brief items` show it.
+///
+/// `id` only ever grows, so it doubles as the cursor: ask for items after the last id seen.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FeedItem {
+    pub id: i64,
+    pub source: String,
+    pub title: String,
+    pub url: Option<String>,
+    pub summary: Option<String>,
+    pub published_at: Option<String>,
+    pub first_seen_at: String,
+    pub enclosure_url: Option<String>,
+    pub enclosure_type: Option<String>,
+    pub image_url: Option<String>,
+    pub has_video: bool,
+}
+
+/// Which stored items to return.
+#[derive(Debug, Clone, Default)]
+pub struct ItemQuery {
+    // only items after this id, oldest first; None = the newest `limit`
+    pub since: Option<i64>,
+    pub ticker_only: bool,
+    pub source: Option<String>,
+    pub limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,6 +245,11 @@ impl Store {
         };
         let mut c = store.conn()?;
         migrate(&mut c)?;
+        // WAL lets the ticker daemon write while the CLI reads; the mode is stored in the file
+        let mode: String = c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            bail!("catalog could not switch to WAL (journal mode {mode})")
+        }
         recover_stale_runs(&c)?;
         Ok(store)
     }
@@ -242,7 +296,7 @@ impl Store {
     pub fn source_by_name(&self, name: &str) -> Result<Source> {
         let c = self.conn()?;
         c.query_row(
-            "SELECT id,name,url,user_agent,enabled FROM sources WHERE name=?1",
+            &format!("SELECT {SOURCE_COLUMNS} FROM sources WHERE name=?1"),
             params![name],
             source_from_row,
         )
@@ -252,8 +306,9 @@ impl Store {
 
     pub fn list_sources(&self) -> Result<Vec<Source>> {
         let c = self.conn()?;
-        let mut st =
-            c.prepare("SELECT id,name,url,user_agent,enabled FROM sources ORDER BY name")?;
+        let mut st = c.prepare(&format!(
+            "SELECT {SOURCE_COLUMNS} FROM sources ORDER BY name"
+        ))?;
         let rows = st
             .query_map([], source_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1012,7 +1067,7 @@ impl Store {
         if timeout_secs == 0 {
             bail!("timeout is invalid")
         }
-        let source = self.source_by_name(name)?;
+        let mut source = self.source_by_name(name)?;
         if !source.enabled {
             bail!("source is disabled")
         }
@@ -1023,14 +1078,29 @@ impl Store {
             params![source.id, started],
         )?;
         let run_id = c.last_insert_rowid();
+        // every attempt counts toward the ticker's schedule, so a failing source backs off too
+        c.execute(
+            "UPDATE sources SET last_fetched_at=?1 WHERE id=?2",
+            params![started, source.id],
+        )?;
+        source.last_fetched_at = Some(started);
         match self.fetch_inner(&source, run_id, max_bytes, timeout_secs) {
-            Ok((artifact, count, _status, _final_url)) => Ok(FetchResult {
+            Ok(FetchOutcome::Stored(artifact, count)) => Ok(FetchResult {
                 schema: JSON_VERSION,
                 source,
                 fetch_run_id: run_id,
                 status: "succeeded".into(),
                 artifact: Some(artifact),
                 items: count,
+                error: None,
+            }),
+            Ok(FetchOutcome::NotModified) => Ok(FetchResult {
+                schema: JSON_VERSION,
+                source,
+                fetch_run_id: run_id,
+                status: "not_modified".into(),
+                artifact: None,
+                items: 0,
                 error: None,
             }),
             Err(e) => {
@@ -1058,25 +1128,43 @@ impl Store {
         run: i64,
         max: u64,
         timeout: u64,
-    ) -> Result<(Artifact, usize, Option<u16>, String)> {
-        let (body, status, final_url, media) = read_source(
+    ) -> Result<FetchOutcome> {
+        let fetched = read_source(
             &source.url,
             &source.user_agent,
             max,
             timeout,
             self.trusted_file_root.as_deref(),
+            Some(&source.validators),
         )?;
-        let feed = parser::parse(body.as_slice()).context("parse RSS/Atom feed")?;
+        let (body, status, final_url, media, validators) = match fetched {
+            // unchanged since last time: record the run, store nothing
+            Fetched::NotModified { final_url } => {
+                self.conn()?.execute(
+                    "UPDATE fetch_runs SET finished_at=?1,status='not_modified',http_status=304,final_url=?2 WHERE id=?3",
+                    params![Utc::now().to_rfc3339(), final_url, run],
+                )?;
+                return Ok(FetchOutcome::NotModified);
+            }
+            Fetched::Body {
+                body,
+                status,
+                final_url,
+                media,
+                validators,
+            } => (body, status, final_url, media, validators),
+        };
+        let feed = feed::parse_feed(&body)?;
         let hash = hex(&Sha256::digest(&body));
         let rel = format!("sha256/{}/{}", &hash[..2], hash);
         let path = self.artifact_root.join(&rel);
         let mut installed = false;
-        let result = (|| -> Result<(Artifact, usize, Option<u16>, String)> {
+        let result = (|| -> Result<FetchOutcome> {
             let mut c = self.conn()?;
             // Serialize artifact installation with catalog ownership decisions.
             // A concurrent fetch cannot insert this artifact while this lock is held.
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let outcome = (|| -> Result<(Artifact, usize, Option<u16>, String)> {
+            let outcome = (|| -> Result<FetchOutcome> {
                 installed = atomic_write_verified(&path, &body, &hash)?;
                 let now = Utc::now().to_rfc3339();
                 let aid = match tx
@@ -1095,23 +1183,32 @@ impl Store {
                 };
                 let mut count = 0usize;
                 for entry in feed.entries {
-                    let guid = nonempty(entry.id.as_str());
-                    let link = entry
-                        .links
-                        .first()
-                        .map(|l| l.href.as_str())
-                        .and_then(nonempty);
-                    let title = entry
-                        .title
-                        .map(|t| t.content)
-                        .unwrap_or_else(|| "(untitled)".into());
+                    let published = entry.published.map(|d| d.to_rfc3339());
                     let identity = identity_key(
-                        guid,
-                        link,
-                        &title,
-                        entry.published.map(|d| d.to_rfc3339()).as_deref(),
+                        entry.guid.as_deref(),
+                        entry.url.as_deref(),
+                        &entry.title,
+                        published.as_deref(),
                     );
-                    tx.execute("INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_id,identity_key) DO NOTHING", params![source.id, identity, guid, link, title, entry.published.map(|d| d.to_rfc3339()), now])?;
+                    let enclosure_url = entry.enclosure.as_ref().map(|e| e.url.as_str());
+                    let enclosure_type = entry
+                        .enclosure
+                        .as_ref()
+                        .and_then(|e| e.media_type.as_deref());
+                    // a known item keeps its identity and first-seen time; the M5 fields are only
+                    // filled where they are still empty (items stored before M5 had none)
+                    tx.execute(
+                        "INSERT INTO feed_items(source_id,identity_key,guid,url,title,published_at,first_seen_at,summary,enclosure_url,enclosure_type,image_url,has_video) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+                         ON CONFLICT(source_id,identity_key) DO UPDATE SET \
+                         summary=COALESCE(feed_items.summary,excluded.summary),\
+                         enclosure_url=COALESCE(feed_items.enclosure_url,excluded.enclosure_url),\
+                         enclosure_type=COALESCE(feed_items.enclosure_type,excluded.enclosure_type),\
+                         image_url=COALESCE(feed_items.image_url,excluded.image_url),\
+                         has_video=MAX(feed_items.has_video,excluded.has_video)",
+                        params![source.id, identity, entry.guid, entry.url, entry.title, published, now,
+                                entry.summary, enclosure_url, enclosure_type, entry.image_url, entry.has_video as i64],
+                    )?;
                     let item_id: i64 = tx.query_row(
                         "SELECT id FROM feed_items WHERE source_id=?1 AND identity_key=?2",
                         params![source.id, identity],
@@ -1120,6 +1217,11 @@ impl Store {
                     tx.execute("INSERT INTO provenance(fetch_run_id,artifact_id,item_id,source_url,fetched_at) VALUES (?1,?2,?3,?4,?5)", params![run, aid, item_id, source.url, now])?;
                     count += 1;
                 }
+                // keep what the server handed out, so the next ask can be answered with a 304
+                tx.execute(
+                    "UPDATE sources SET etag=?1,last_modified=?2 WHERE id=?3",
+                    params![validators.etag, validators.last_modified, source.id],
+                )?;
                 tx.execute("UPDATE fetch_runs SET finished_at=?1,status='succeeded',http_status=?2,final_url=?3 WHERE id=?4", params![now, status, final_url, run])?;
                 let artifact = Artifact {
                     id: aid,
@@ -1128,7 +1230,7 @@ impl Store {
                     path: rel,
                     media_type: media,
                 };
-                Ok((artifact, count, status, final_url))
+                Ok(FetchOutcome::Stored(artifact, count))
             })();
             if outcome.is_err() && installed {
                 // Delete only while the IMMEDIATE transaction still owns the
@@ -1149,6 +1251,132 @@ impl Store {
         })();
         result
     }
+
+    // ── Ticker ──────────────────────────────────────────────────────────
+
+    /// Show or hide a source on the live ticker, optionally changing how often it is asked.
+    pub fn set_ticker(&self, name: &str, on: bool, every_seconds: Option<i64>) -> Result<Source> {
+        if let Some(every) = every_seconds {
+            if !(MIN_TICKER_INTERVAL..=MAX_TICKER_INTERVAL).contains(&every) {
+                bail!("ticker interval must be {MIN_TICKER_INTERVAL}\u{2013}{MAX_TICKER_INTERVAL} seconds")
+            }
+        }
+        let c = self.conn()?;
+        let changed = c.execute(
+            "UPDATE sources SET ticker=?1,fetch_interval_seconds=COALESCE(?2,fetch_interval_seconds) WHERE name=?3",
+            params![on as i64, every_seconds, name],
+        )?;
+        if changed != 1 {
+            bail!("source not found")
+        }
+        self.source_by_name(name)
+    }
+
+    /// Ticker sources whose interval has passed since their last attempt (never tried = due).
+    pub fn due_ticker_sources(&self, now: DateTime<Utc>) -> Result<Vec<Source>> {
+        Ok(self
+            .list_sources()?
+            .into_iter()
+            .filter(|s| s.enabled && s.ticker)
+            .filter(|s| {
+                let last = s
+                    .last_fetched_at
+                    .as_deref()
+                    .and_then(|t| DateTime::parse_from_rfc3339(t).ok());
+                // an unreadable timestamp counts as never tried rather than never due
+                last.is_none_or(|t| {
+                    t.with_timezone(&Utc) + ChronoDuration::seconds(s.fetch_interval_seconds) <= now
+                })
+            })
+            .collect())
+    }
+
+    /// Stored items, always oldest first so the last id is the next cursor.
+    pub fn items(&self, query: &ItemQuery) -> Result<Vec<FeedItem>> {
+        let limit = query.limit.clamp(1, MAX_ITEMS) as i64;
+        let c = self.conn()?;
+        // since → the next items after the cursor; no cursor → the newest `limit`, then reversed
+        let order = if query.since.is_some() { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT i.id,s.name,i.title,i.url,i.summary,i.published_at,i.first_seen_at,i.enclosure_url,i.enclosure_type,i.image_url,i.has_video \
+             FROM feed_items i JOIN sources s ON s.id=i.source_id \
+             WHERE i.id > ?1 AND (?2 = 0 OR s.ticker = 1) AND (?3 IS NULL OR s.name = ?3) \
+             ORDER BY i.id {order} LIMIT ?4"
+        );
+        let mut st = c.prepare(&sql)?;
+        let mut rows = st
+            .query_map(
+                params![
+                    query.since.unwrap_or(0),
+                    query.ticker_only as i64,
+                    query.source,
+                    limit
+                ],
+                |r| {
+                    Ok(FeedItem {
+                        id: r.get(0)?,
+                        source: r.get(1)?,
+                        title: r.get(2)?,
+                        url: r.get::<_, Option<String>>(3)?.as_deref().and_then(link_url),
+                        summary: r.get(4)?,
+                        published_at: r.get(5)?,
+                        first_seen_at: r.get(6)?,
+                        enclosure_url: r.get::<_, Option<String>>(7)?.as_deref().and_then(link_url),
+                        enclosure_type: r.get(8)?,
+                        image_url: r.get::<_, Option<String>>(9)?.as_deref().and_then(link_url),
+                        has_video: r.get::<_, i64>(10)? != 0,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if query.since.is_none() {
+            rows.reverse();
+        }
+        Ok(rows)
+    }
+}
+
+/// How one fetch ended when it did not fail.
+enum FetchOutcome {
+    Stored(Artifact, usize),
+    NotModified,
+}
+
+/// Fetch and parse any http(s) feed through the same guarded path as sources, storing nothing.
+///
+/// For consumers that keep their own data (mg-streamr's podcasts): SSRF checks, pinned DNS,
+/// the byte cap and the redirect limit all apply. No file:// and no catalog.
+pub fn fetch_feed_url(
+    url: &str,
+    user_agent: Option<&str>,
+    max_bytes: u64,
+    timeout_secs: u64,
+) -> Result<feed::ParsedFeed> {
+    if max_bytes == 0 || timeout_secs == 0 {
+        bail!("maximum bytes and timeout must be above zero")
+    }
+    let ua = user_agent.unwrap_or(DEFAULT_USER_AGENT);
+    if ua.contains('\r') || ua.contains('\n') || ua.len() > 512 {
+        bail!("user-agent is invalid")
+    }
+    match read_source(url, ua, max_bytes, timeout_secs, None, None)? {
+        Fetched::Body { body, .. } => feed::parse_feed(&body),
+        // no validators were sent, so a 304 is the server misbehaving
+        Fetched::NotModified { .. } => bail!("unexpected 304 without a conditional request"),
+    }
+}
+
+// A link safe to hand to a browser or player: http(s) only, embedded credentials removed.
+// The query stays — a video id or a private feed's token lives there and opening needs it.
+// A feed saying `javascript:` or `file:` gets None, so the ticker can never open one
+fn link_url(raw: &str) -> Option<String> {
+    let mut u = Url::parse(raw.trim()).ok()?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return None;
+    }
+    let _ = u.set_password(None);
+    let _ = u.set_username("");
+    Some(u.to_string())
 }
 
 #[derive(Debug)]
@@ -1385,6 +1613,10 @@ fn safe_diagnostic(message: &str) -> String {
     }
 }
 
+// every query that builds a Source selects these, in this order
+const SOURCE_COLUMNS: &str =
+    "id,name,url,user_agent,enabled,ticker,fetch_interval_seconds,last_fetched_at,etag,last_modified";
+
 fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
     Ok(Source {
         id: r.get(0)?,
@@ -1392,6 +1624,13 @@ fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
         url: r.get(2)?,
         user_agent: r.get(3)?,
         enabled: r.get::<_, i64>(4)? != 0,
+        ticker: r.get::<_, i64>(5)? != 0,
+        fetch_interval_seconds: r.get(6)?,
+        last_fetched_at: r.get(7)?,
+        validators: Validators {
+            etag: r.get(8)?,
+            last_modified: r.get(9)?,
+        },
     })
 }
 
@@ -1413,6 +1652,9 @@ const M1_CATALOG_FOUNDATION: &str = "CREATE TABLE sources (id INTEGER PRIMARY KE
 const M2_FEED_ITEM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_feed_items_source_identity ON feed_items(source_id, identity_key);";
 const M3_CVE_INTELLIGENCE: &str = "CREATE TABLE artifact_owners (source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,PRIMARY KEY(source_id,artifact_id,locator)); CREATE TABLE cve_versions (id TEXT PRIMARY KEY,cve_id TEXT NOT NULL,revision TEXT NOT NULL,modified_at TEXT NOT NULL,record_json TEXT NOT NULL,version_json TEXT NOT NULL,observed_at TEXT NOT NULL,UNIQUE(cve_id,revision)); CREATE TABLE cve_current (cve_id TEXT PRIMARY KEY,version_id TEXT NOT NULL UNIQUE REFERENCES cve_versions(id)); CREATE TABLE cve_version_provenance (version_id TEXT NOT NULL REFERENCES cve_versions(id),ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,artifact_id INTEGER NOT NULL REFERENCES artifacts(id),locator TEXT NOT NULL,retrieved_at TEXT NOT NULL,source_version TEXT,PRIMARY KEY(version_id,ordinal)); CREATE INDEX idx_cve_history ON cve_versions(cve_id,modified_at DESC,id DESC);";
 const M4_ASSET_INVENTORY: &str = "CREATE TABLE asset_records (id TEXT PRIMARY KEY,created_at TEXT NOT NULL,asset_json TEXT NOT NULL); CREATE TABLE asset_observations (id TEXT PRIMARY KEY,asset_id TEXT NOT NULL REFERENCES asset_records(id),observed_at TEXT NOT NULL,corrects_observation_id TEXT REFERENCES asset_observations(id),observation_json TEXT NOT NULL); CREATE INDEX idx_asset_observations_asset_time ON asset_observations(asset_id,observed_at DESC,id DESC);";
+
+// ticker and podcast fields: columns only, so earlier tables and checksums stay as they were
+const M5_TICKER_FIELDS: &str = "ALTER TABLE sources ADD COLUMN ticker INTEGER NOT NULL DEFAULT 0; ALTER TABLE sources ADD COLUMN fetch_interval_seconds INTEGER NOT NULL DEFAULT 300; ALTER TABLE sources ADD COLUMN etag TEXT; ALTER TABLE sources ADD COLUMN last_modified TEXT; ALTER TABLE sources ADD COLUMN last_fetched_at TEXT; ALTER TABLE feed_items ADD COLUMN summary TEXT; ALTER TABLE feed_items ADD COLUMN enclosure_url TEXT; ALTER TABLE feed_items ADD COLUMN enclosure_type TEXT; ALTER TABLE feed_items ADD COLUMN image_url TEXT; ALTER TABLE feed_items ADD COLUMN has_video INTEGER NOT NULL DEFAULT 0; CREATE INDEX idx_feed_items_source_id ON feed_items(source_id,id);";
 
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1453,6 +1695,13 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: M4_ASSET_INVENTORY,
         checksum: "889633572fc79f050fc7ff80317def6211e2698ffd3acf95f59ebd5f1d461724",
         tables: &["asset_records", "asset_observations"],
+    },
+    Migration {
+        version: 5,
+        name: "ticker_fields",
+        sql: M5_TICKER_FIELDS,
+        checksum: "11b6fcabcdcd1374d3a90050d0601fb7989069cd71f570c9ee2cbec2d4e85d2d",
+        tables: &[],
     },
 ];
 
@@ -1645,22 +1894,88 @@ fn validate_parsed_url(u: Url) -> Result<Url> {
     Ok(u)
 }
 
+// What one read of a source produced
+enum Fetched {
+    Body {
+        body: Vec<u8>,
+        status: Option<u16>,
+        final_url: String,
+        media: String,
+        validators: Validators,
+    },
+    // the server answered 304: nothing changed since the validators were issued
+    NotModified {
+        final_url: String,
+    },
+}
+
+// the longest validator kept; anything longer is noise, not a cache key
+const MAX_VALIDATOR_LEN: usize = 256;
+
+// Headers that make a request conditional; a stored value that is not a valid header is skipped
+fn conditional_headers(validators: &Validators) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let pairs = [
+        (reqwest::header::IF_NONE_MATCH, &validators.etag),
+        (
+            reqwest::header::IF_MODIFIED_SINCE,
+            &validators.last_modified,
+        ),
+    ];
+    for (name, value) in pairs {
+        if let Some(value) = value
+            .as_deref()
+            .and_then(|v| reqwest::header::HeaderValue::from_str(v).ok())
+        {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+// The validators a response hands out, kept only when short, visible ASCII
+fn response_validators(headers: &reqwest::header::HeaderMap) -> Validators {
+    let read = |name: reqwest::header::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| {
+                !v.is_empty()
+                    && v.len() <= MAX_VALIDATOR_LEN
+                    && v.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            })
+            .map(str::to_owned)
+    };
+    Validators {
+        etag: read(reqwest::header::ETAG),
+        last_modified: read(reqwest::header::LAST_MODIFIED),
+    }
+}
+
 fn read_source(
     source: &str,
     ua: &str,
     max: u64,
     timeout: u64,
     file_root: Option<&Path>,
-) -> Result<(Vec<u8>, Option<u16>, String, String)> {
+    validators: Option<&Validators>,
+) -> Result<Fetched> {
     let mut u = validate_url(source)?;
     if u.scheme() == "file" {
         let root = file_root.context("file sources require trusted fixture mode")?;
         let p = u
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("invalid file source"))?;
-        return read_trusted_file(root, &p, max)
-            .map(|b| (b, None, redact_url(source), "application/rss+xml".into()));
+        // a fixture file has no cache validators; it is read whole every time
+        return read_trusted_file(root, &p, max).map(|body| Fetched::Body {
+            body,
+            status: None,
+            final_url: redact_url(source),
+            media: "application/rss+xml".into(),
+            validators: Validators::default(),
+        });
     }
+    let conditional = validators.map(conditional_headers).unwrap_or_default();
     for _ in 0..=MAX_REDIRECTS {
         let address = validate_network_target(&u)?;
         let client = Client::builder()
@@ -1676,7 +1991,12 @@ fn read_source(
                 address,
             )
             .build()?;
-        let r = client.get(u.clone()).send()?;
+        let r = client.get(u.clone()).headers(conditional.clone()).send()?;
+        if r.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Fetched::NotModified {
+                final_url: redact_url(u.as_str()),
+            });
+        }
         if r.status().is_redirection() {
             let location = r
                 .headers()
@@ -1690,7 +2010,15 @@ fn read_source(
             }
             continue;
         }
-        return read_response(r, max, redact_url(u.as_str()));
+        let validators = response_validators(r.headers());
+        let (body, status, final_url, media) = read_response(r, max, redact_url(u.as_str()))?;
+        return Ok(Fetched::Body {
+            body,
+            status,
+            final_url,
+            media,
+            validators,
+        });
     }
     bail!("too many redirects")
 }
@@ -2146,9 +2474,6 @@ fn identity_key(
         (None, None) => format!("fallback\u{1f}{title}\u{1f}{}", published.unwrap_or("")),
     }
 }
-fn nonempty(s: &str) -> Option<&str> {
-    (!s.trim().is_empty()).then_some(s)
-}
 fn redact_url(raw: &str) -> String {
     Url::parse(raw)
         .map(|mut u| {
@@ -2184,6 +2509,67 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn stored_validators_make_the_request_conditional_and_bad_ones_are_skipped() {
+        let headers = conditional_headers(&Validators {
+            etag: Some("\"v1\"".into()),
+            last_modified: Some("Fri, 18 Sep 2026 10:00:00 GMT".into()),
+        });
+        assert_eq!(
+            headers.get(reqwest::header::IF_NONE_MATCH).unwrap(),
+            "\"v1\""
+        );
+        assert!(headers.contains_key(reqwest::header::IF_MODIFIED_SINCE));
+        // a value that cannot be a header (a newline) is dropped, never sent
+        let bad = conditional_headers(&Validators {
+            etag: Some("a\nb".into()),
+            last_modified: None,
+        });
+        assert!(bad.is_empty());
+        assert!(conditional_headers(&Validators::default()).is_empty());
+    }
+
+    #[test]
+    fn only_short_printable_validators_are_kept_from_a_response() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::ETAG, "W/\"abc\"".parse().unwrap());
+        headers.insert(
+            reqwest::header::LAST_MODIFIED,
+            "x".repeat(MAX_VALIDATOR_LEN + 1).parse().unwrap(),
+        );
+        let kept = response_validators(&headers);
+        assert_eq!(kept.etag.as_deref(), Some("W/\"abc\""));
+        assert_eq!(kept.last_modified, None, "an oversized value is noise");
+    }
+
+    #[test]
+    fn links_handed_out_are_http_only_without_credentials_but_keep_their_query() {
+        assert_eq!(
+            link_url("https://u:p@example.com/watch?v=1#t").as_deref(),
+            Some("https://example.com/watch?v=1#t")
+        );
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(link_url(bad), None, "{bad}");
+        }
+    }
+
+    // Put a test catalog back on the rollback journal. There a held read lock blocks the
+    // commit — the only way to make a commit fail on purpose. WAL, the default since M5,
+    // lets readers and a committing writer run together, so the failure would never happen
+    fn use_rollback_journal(store: &Store) -> Result<()> {
+        let mode: String = store
+            .conn()?
+            .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+        assert_eq!(mode, "delete");
+        Ok(())
+    }
 
     fn cve_fixture(
         artifact_path: &Path,
@@ -2342,7 +2728,8 @@ mod tests {
             .prepare("SELECT version FROM schema_migrations ORDER BY version")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        // every embedded migration exactly once, however many there are now
+        assert_eq!(versions, (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>());
         Ok(())
     }
 
@@ -2680,6 +3067,7 @@ mod tests {
                 directory.path().join("db.sqlite"),
                 directory.path().join("artifacts"),
             )?;
+            use_rollback_journal(&store)?;
             let (record, version, artifact) = cve_fixture(
                 &artifact_path,
                 0,
@@ -2799,6 +3187,7 @@ mod tests {
             directory.path().join("db.sqlite"),
             directory.path().join("artifacts"),
         )?;
+        use_rollback_journal(&store)?;
         let (record, version, artifact) = cve_fixture(
             &artifact_path,
             0,
