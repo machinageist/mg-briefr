@@ -60,7 +60,8 @@ pub struct ParsedFeed {
 
 // Parse RSS, Atom or JSON Feed bytes into plain entries
 pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
-    let feed = parser::parse(bytes).context("parse RSS/Atom feed")?;
+    let fixed = fix_minute_durations(bytes);
+    let feed = parser::parse(fixed.as_ref()).context("parse RSS/Atom feed")?;
     // a channel's artwork: the podcast cover (iTunes image / logo), else its icon
     let image_url = feed
         .logo
@@ -73,6 +74,57 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
         image_url,
         entries: feed.entries.into_iter().map(read_entry).collect(),
     })
+}
+
+// the tag whose value feed-rs misreads
+const ITUNES_DURATION: &[u8] = b"<itunes:duration>";
+
+// feed-rs knows "H:MM:SS" and plain seconds but not the common "MM:SS", so "30:00" came out as
+// 30 seconds — and a player would call a 30-minute episode finished at once. Rewrite each
+// "MM:SS" inside <itunes:duration> as "0:MM:SS" before parsing; nothing else is touched
+fn fix_minute_durations(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let find = |haystack: &[u8], from: usize| {
+        haystack[from..]
+            .windows(ITUNES_DURATION.len())
+            .position(|w| w == ITUNES_DURATION)
+            .map(|p| from + p)
+    };
+    let Some(first) = find(bytes, 0) else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut done = 0;
+    let mut next = Some(first);
+    while let Some(tag) = next {
+        let value_start = tag + ITUNES_DURATION.len();
+        let value_end = bytes[value_start..]
+            .iter()
+            .position(|b| *b == b'<')
+            .map_or(bytes.len(), |p| value_start + p);
+        let value = &bytes[value_start..value_end];
+        // the hours go right before the digits, after any leading spaces
+        let lead = value.len() - value.trim_ascii_start().len();
+        out.extend_from_slice(&bytes[done..value_start + lead]);
+        if is_minutes_seconds(value.trim_ascii()) {
+            out.extend_from_slice(b"0:");
+        }
+        out.extend_from_slice(&value[lead..]);
+        done = value_end;
+        next = find(bytes, value_end);
+    }
+    out.extend_from_slice(&bytes[done..]);
+    std::borrow::Cow::Owned(out)
+}
+
+// "30:00" or "5:07": 1–3 digits of minutes, a colon, exactly 2 digits of seconds
+fn is_minutes_seconds(text: &[u8]) -> bool {
+    let Some(colon) = text.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    let (minutes, seconds) = (&text[..colon], &text[colon + 1..]);
+    (1..=3).contains(&minutes.len())
+        && seconds.len() == 2
+        && minutes.iter().chain(seconds).all(u8::is_ascii_digit)
 }
 
 // One feed-rs entry → the fields the suite uses
@@ -361,6 +413,29 @@ mod tests {
             plain_text("<script>x</script>", 10),
             "x",
             "only tags go; text inside stays"
+        );
+    }
+
+    #[test]
+    fn minute_second_durations_are_read_as_minutes() {
+        let feed = |d: &str| {
+            format!(
+                r#"<?xml version="1.0"?><rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel><title>S</title><item><title>E</title><guid>g</guid><enclosure url="https://c.example/e.mp3" type="audio/mpeg" length="1"/><itunes:duration>{d}</itunes:duration></item></channel></rss>"#
+            )
+        };
+        let seconds = |d: &str| parse_feed(feed(d).as_bytes()).unwrap().entries[0].duration_seconds;
+        assert_eq!(
+            seconds("30:00"),
+            Some(1800),
+            "MM:SS is minutes, not seconds"
+        );
+        assert_eq!(seconds(" 5:07 "), Some(307));
+        assert_eq!(seconds("01:02:03"), Some(3723), "H:MM:SS unchanged");
+        assert_eq!(seconds("1800"), Some(1800), "plain seconds unchanged");
+        assert!(
+            is_minutes_seconds(b"90:00")
+                && !is_minutes_seconds(b"1:02:03")
+                && !is_minutes_seconds(b"30:0")
         );
     }
 
