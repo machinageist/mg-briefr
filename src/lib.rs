@@ -1316,7 +1316,8 @@ impl Store {
                     Ok(FeedItem {
                         id: r.get(0)?,
                         source: r.get(1)?,
-                        title: r.get(2)?,
+                        // stored raw (it can be part of the identity key); cleaned for display
+                        title: feed::title_text(&r.get::<_, String>(2)?),
                         url: r.get::<_, Option<String>>(3)?.as_deref().and_then(link_url),
                         summary: r.get(4)?,
                         published_at: r.get(5)?,

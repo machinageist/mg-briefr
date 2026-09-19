@@ -18,6 +18,7 @@ use serde::Serialize;
 use url::Url;
 
 pub const SUMMARY_MAX_CHARS: usize = 400;
+pub const TITLE_MAX_CHARS: usize = 300;
 pub const UNTITLED: &str = "(untitled)";
 // sites whose links are videos even without a video enclosure
 const VIDEO_HOSTS: [&str; 5] = [
@@ -202,6 +203,22 @@ pub fn plain_text(html: &str, max: usize) -> String {
     cut
 }
 
+// A headline for display: entities decoded, spaces collapsed, at most `TITLE_MAX_CHARS`
+// no tag stripping — a plain RSS title may truly contain "<" once the XML is unescaped;
+// only HTML-typed titles (The Verge's Atom) leave entities like "&#8217;" behind
+pub fn title_text(raw: &str) -> String {
+    let collapsed = decode_entities(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() <= TITLE_MAX_CHARS {
+        return collapsed;
+    }
+    let mut cut: String = collapsed.chars().take(TITLE_MAX_CHARS - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
 // Decode the entities feeds actually use; anything unrecognised stays as written
 fn decode_entities(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -344,6 +361,16 @@ mod tests {
             plain_text("<script>x</script>", 10),
             "x",
             "only tags go; text inside stays"
+        );
+    }
+
+    #[test]
+    fn titles_decode_entities_but_keep_a_real_angle_bracket() {
+        assert_eq!(title_text("doesn&#8217;t  stop"), "doesn\u{2019}t stop");
+        assert_eq!(title_text("a < b &amp; c"), "a < b & c");
+        assert_eq!(
+            title_text(&"x".repeat(400)).chars().count(),
+            TITLE_MAX_CHARS
         );
     }
 
