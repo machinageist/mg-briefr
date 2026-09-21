@@ -95,6 +95,8 @@ pub struct FeedItem {
     pub enclosure_type: Option<String>,
     pub image_url: Option<String>,
     pub has_video: bool,
+    pub read_at: Option<String>,
+    pub saved_at: Option<String>,
 }
 
 /// Which stored items to return.
@@ -104,6 +106,10 @@ pub struct ItemQuery {
     pub since: Option<i64>,
     pub ticker_only: bool,
     pub source: Option<String>,
+    /// only items nothing has read yet
+    pub unread_only: bool,
+    /// only items that were kept
+    pub saved_only: bool,
     pub limit: usize,
 }
 
@@ -1298,9 +1304,10 @@ impl Store {
         // since → the next items after the cursor; no cursor → the newest `limit`, then reversed
         let order = if query.since.is_some() { "ASC" } else { "DESC" };
         let sql = format!(
-            "SELECT i.id,s.name,i.title,i.url,i.summary,i.published_at,i.first_seen_at,i.enclosure_url,i.enclosure_type,i.image_url,i.has_video \
+            "SELECT {ITEM_COLUMNS} \
              FROM feed_items i JOIN sources s ON s.id=i.source_id \
              WHERE i.id > ?1 AND (?2 = 0 OR s.ticker = 1) AND (?3 IS NULL OR s.name = ?3) \
+             AND (?5 = 0 OR i.read_at IS NULL) AND (?6 = 0 OR i.saved_at IS NOT NULL) \
              ORDER BY i.id {order} LIMIT ?4"
         );
         let mut st = c.prepare(&sql)?;
@@ -1310,24 +1317,11 @@ impl Store {
                     query.since.unwrap_or(0),
                     query.ticker_only as i64,
                     query.source,
-                    limit
+                    limit,
+                    query.unread_only as i64,
+                    query.saved_only as i64
                 ],
-                |r| {
-                    Ok(FeedItem {
-                        id: r.get(0)?,
-                        source: r.get(1)?,
-                        // stored raw (it can be part of the identity key); cleaned for display
-                        title: feed::title_text(&r.get::<_, String>(2)?),
-                        url: r.get::<_, Option<String>>(3)?.as_deref().and_then(link_url),
-                        summary: r.get(4)?,
-                        published_at: r.get(5)?,
-                        first_seen_at: r.get(6)?,
-                        enclosure_url: r.get::<_, Option<String>>(7)?.as_deref().and_then(link_url),
-                        enclosure_type: r.get(8)?,
-                        image_url: r.get::<_, Option<String>>(9)?.as_deref().and_then(link_url),
-                        has_video: r.get::<_, i64>(10)? != 0,
-                    })
-                },
+                item_from_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if query.since.is_none() {
@@ -1335,6 +1329,30 @@ impl Store {
         }
         Ok(rows)
     }
+}
+
+/// Every column one item is read from, in the order `item_from_row` expects.
+const ITEM_COLUMNS: &str = "i.id,s.name,i.title,i.url,i.summary,i.published_at,i.first_seen_at,\
+     i.enclosure_url,i.enclosure_type,i.image_url,i.has_video,i.read_at,i.saved_at";
+
+// One stored item from a row of ITEM_COLUMNS
+fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FeedItem> {
+    Ok(FeedItem {
+        id: r.get(0)?,
+        source: r.get(1)?,
+        // stored raw (it can be part of the identity key); cleaned for display
+        title: feed::title_text(&r.get::<_, String>(2)?),
+        url: r.get::<_, Option<String>>(3)?.as_deref().and_then(link_url),
+        summary: r.get(4)?,
+        published_at: r.get(5)?,
+        first_seen_at: r.get(6)?,
+        enclosure_url: r.get::<_, Option<String>>(7)?.as_deref().and_then(link_url),
+        enclosure_type: r.get(8)?,
+        image_url: r.get::<_, Option<String>>(9)?.as_deref().and_then(link_url),
+        has_video: r.get::<_, i64>(10)? != 0,
+        read_at: r.get(11)?,
+        saved_at: r.get(12)?,
+    })
 }
 
 /// How one fetch ended when it did not fail.
@@ -1729,6 +1747,11 @@ const M4_ASSET_INVENTORY: &str = "CREATE TABLE asset_records (id TEXT PRIMARY KE
 // ticker and podcast fields: columns only, so earlier tables and checksums stay as they were
 const M5_TICKER_FIELDS: &str = "ALTER TABLE sources ADD COLUMN ticker INTEGER NOT NULL DEFAULT 0; ALTER TABLE sources ADD COLUMN fetch_interval_seconds INTEGER NOT NULL DEFAULT 300; ALTER TABLE sources ADD COLUMN etag TEXT; ALTER TABLE sources ADD COLUMN last_modified TEXT; ALTER TABLE sources ADD COLUMN last_fetched_at TEXT; ALTER TABLE feed_items ADD COLUMN summary TEXT; ALTER TABLE feed_items ADD COLUMN enclosure_url TEXT; ALTER TABLE feed_items ADD COLUMN enclosure_type TEXT; ALTER TABLE feed_items ADD COLUMN image_url TEXT; ALTER TABLE feed_items ADD COLUMN has_video INTEGER NOT NULL DEFAULT 0; CREATE INDEX idx_feed_items_source_id ON feed_items(source_id,id);";
 
+// Reading: which items have been read or kept, and the page each item's link pointed at.
+// The page is an artifact like any other fetch, so its bytes keep their provenance and a
+// rendered view is always derived, never stored as if it were the source
+const M6_READING: &str = "ALTER TABLE feed_items ADD COLUMN read_at TEXT; ALTER TABLE feed_items ADD COLUMN saved_at TEXT; CREATE TABLE item_content (item_id INTEGER PRIMARY KEY REFERENCES feed_items(id),artifact_id INTEGER NOT NULL REFERENCES artifacts(id),final_url TEXT NOT NULL,fetched_at TEXT NOT NULL);";
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1775,6 +1798,13 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: M5_TICKER_FIELDS,
         checksum: "11b6fcabcdcd1374d3a90050d0601fb7989069cd71f570c9ee2cbec2d4e85d2d",
         tables: &[],
+    },
+    Migration {
+        version: 6,
+        name: "reading",
+        sql: M6_READING,
+        checksum: "68ca6c484c1f80a0710eef3b73f014365e78404eb651ae6761a6c73ada734565",
+        tables: &["item_content"],
     },
 ];
 
