@@ -3,6 +3,16 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn run(db: &Path, artifacts: &Path, args: &[&str]) -> Output {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            db.parent().expect("catalog parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private catalog parent");
+    }
     Command::new(env!("CARGO_BIN_EXE_mg-brief"))
         .arg("--db")
         .arg(db)

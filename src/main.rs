@@ -1,4 +1,7 @@
-use anyhow::Result;
+mod integrity;
+mod recovery;
+
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use mg_brief::cve::{adapt_cve_json5, CveRecord, CveVersion, StableId};
@@ -78,6 +81,25 @@ enum Command {
     Status,
     /// Report embedded migration state without opening the store for writing
     Migrations,
+    /// Check all catalog pages without migrating or changing data
+    Integrity {
+        #[arg(long, required = true)]
+        acknowledge_offline: bool,
+    },
+    /// Recover through a private backup; stop mg-feedr and every writer to this mg-brief catalog first
+    Recover {
+        #[arg(long, required = true)]
+        acknowledge_offline: bool,
+        /// Install only if the recovered catalog validates and exactly preserves readable table records
+        #[arg(long)]
+        apply: bool,
+        /// Permit strict row subsets only in sources, fetch_runs, artifacts, and provenance
+        #[arg(long, requires = "apply")]
+        allow_record_loss: bool,
+        /// Require and restore every source from an authoritative feed-seed manifest
+        #[arg(long, value_name = "JSON")]
+        seed_manifest: Option<PathBuf>,
+    },
     Cve {
         #[command(subcommand)]
         command: CveCommand,
@@ -184,17 +206,48 @@ fn status(db: &Path) -> serde_json::Value {
     })
 }
 
+fn ensure_feedr_inactive() -> Result<()> {
+    let output = std::process::Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=1s",
+            "10s",
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            "mg-feedr.service",
+            "--property=ActiveState",
+            "--value",
+        ])
+        .output()
+        .context("checking mg-feedr.service before catalog inspection or recovery")?;
+    if !output.status.success() {
+        anyhow::bail!("cannot verify that mg-feedr.service is stopped");
+    }
+    let state = String::from_utf8_lossy(&output.stdout);
+    require_feedr_inactive_state(state.trim())
+}
+
+fn require_feedr_inactive_state(state: &str) -> Result<()> {
+    if state == "inactive" {
+        Ok(())
+    } else {
+        anyhow::bail!("mg-feedr.service must be inactive before catalog inspection or recovery")
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (db, root) = mg_brief::default_paths();
+    let (_, root) = mg_brief::default_paths();
+    let db = mg_brief::database_path(cli.db)?;
     if matches!(cli.command, Command::Status) {
-        println!("{}", to_string_pretty(&status(&cli.db.unwrap_or(db)))?);
+        println!("{}", to_string_pretty(&status(&db))?);
         return Ok(());
     }
     // Read the ledger without migrating, so a drifted catalog can be inspected
     // rather than only refused.
     if matches!(cli.command, Command::Migrations) {
-        let path = cli.db.unwrap_or(db);
+        let path = db;
         let states = if path.is_file() {
             let connection = rusqlite::Connection::open_with_flags(
                 &path,
@@ -207,7 +260,37 @@ fn main() -> Result<()> {
         println!("{}", to_string_pretty(&states)?);
         return Ok(());
     }
-    let store = Store::open(cli.db.unwrap_or(db), cli.artifact_root.unwrap_or(root))?;
+    if let Command::Integrity {
+        acknowledge_offline,
+    } = &cli.command
+    {
+        ensure_feedr_inactive()?;
+        let snapshot = recovery::snapshot_for_integrity(&db, *acknowledge_offline)?;
+        println!(
+            "{}",
+            to_string_pretty(&integrity::inspect(snapshot.database_path()))?
+        );
+        return Ok(());
+    }
+    if let Command::Recover {
+        apply,
+        allow_record_loss,
+        acknowledge_offline,
+        seed_manifest,
+    } = &cli.command
+    {
+        ensure_feedr_inactive()?;
+        let report = recovery::recover_with_seed_manifest(
+            &db,
+            *apply,
+            *allow_record_loss,
+            *acknowledge_offline,
+            seed_manifest.as_deref(),
+        )?;
+        println!("{}", to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let store = Store::open(db, cli.artifact_root.unwrap_or(root))?;
     match cli.command {
         Command::Register {
             name,
@@ -237,6 +320,8 @@ fn main() -> Result<()> {
                 since,
                 ticker_only: ticker,
                 source,
+                unread_only: false,
+                saved_only: false,
                 limit,
             })?)?
         ),
@@ -255,8 +340,11 @@ fn main() -> Result<()> {
             }
             println!("{}", to_string_pretty(&store.export_interop_snapshot()?)?)
         }
-        Command::Status | Command::Migrations => {
-            unreachable!("both are handled before opening the store")
+        Command::Status
+        | Command::Migrations
+        | Command::Integrity { .. }
+        | Command::Recover { .. } => {
+            unreachable!("all are handled before opening the store")
         }
         Command::Cve { command } => match command {
             CveCommand::ImportCve5 {
@@ -351,4 +439,61 @@ fn read_bounded_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
         anyhow::bail!("asset import document is unavailable or too large")
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod feedr_state_tests {
+    use super::{require_feedr_inactive_state, Cli};
+    use clap::Parser;
+
+    #[test]
+    fn only_inactive_feedr_unit_state_is_accepted() {
+        assert!(require_feedr_inactive_state("inactive").is_ok());
+        assert!(require_feedr_inactive_state("activating").is_err());
+        assert!(require_feedr_inactive_state("active").is_err());
+        assert!(require_feedr_inactive_state("failed").is_err());
+    }
+
+    #[test]
+    fn integrity_cli_requires_offline_acknowledgement() {
+        assert!(Cli::try_parse_from(["mg-brief", "integrity"]).is_err());
+        assert!(Cli::try_parse_from(["mg-brief", "integrity", "--acknowledge-offline"]).is_ok());
+    }
+
+    #[test]
+    fn recovery_cli_requires_offline_acknowledgement() {
+        assert!(Cli::try_parse_from(["mg-brief", "recover"]).is_err());
+        assert!(Cli::try_parse_from(["mg-brief", "recover", "--acknowledge-offline"]).is_ok());
+    }
+
+    #[test]
+    fn recovery_cli_accepts_a_historical_seed_manifest_path() {
+        assert!(Cli::try_parse_from([
+            "mg-brief",
+            "recover",
+            "--acknowledge-offline",
+            "--seed-manifest",
+            "/private/seed-manifest.json"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn recovery_loss_override_requires_apply_and_offline_acknowledgement() {
+        assert!(Cli::try_parse_from([
+            "mg-brief",
+            "recover",
+            "--acknowledge-offline",
+            "--allow-record-loss"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "mg-brief",
+            "recover",
+            "--acknowledge-offline",
+            "--apply",
+            "--allow-record-loss"
+        ])
+        .is_ok());
+    }
 }

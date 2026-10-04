@@ -1,6 +1,7 @@
 pub mod asset;
 pub mod cve;
 pub mod feed;
+mod secure_db;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -14,9 +15,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{ErrorKind, Read},
     net::{IpAddr, ToSocketAddrs},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
@@ -32,6 +34,8 @@ const STALE_RUN_AGE: ChronoDuration = ChronoDuration::hours(1);
 const MIN_TICKER_INTERVAL: i64 = 30;
 const MAX_TICKER_INTERVAL: i64 = 86_400;
 const MAX_ITEMS: usize = 1000;
+const MAX_DOWNLOAD_PART_ATTEMPTS: usize = 128;
+static DOWNLOAD_PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -241,9 +245,6 @@ impl Store {
         fs::create_dir_all(&artifact_root)?;
         let root = fs::canonicalize(&artifact_root)?;
         let file_root = trusted_file_root.map(fs::canonicalize).transpose()?;
-        if let Some(parent) = db_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let store = Self {
             db_path,
             artifact_root: root,
@@ -256,12 +257,14 @@ impl Store {
         if !mode.eq_ignore_ascii_case("wal") {
             bail!("catalog could not switch to WAL (journal mode {mode})")
         }
+        secure_db::ensure_database_sidecars(&store.db_path).context("secure catalog sidecars")?;
         recover_stale_runs(&c)?;
         Ok(store)
     }
 
     fn conn(&self) -> Result<Connection> {
-        let c = Connection::open(&self.db_path).context("open catalog")?;
+        secure_db::prepare_database_path(&self.db_path).context("secure catalog path")?;
+        let c = secure_db::open_database(&self.db_path).context("open catalog")?;
         c.busy_timeout(Duration::from_secs(5))
             .context("configure catalog lock")?;
         c.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -1264,7 +1267,9 @@ impl Store {
     pub fn set_ticker(&self, name: &str, on: bool, every_seconds: Option<i64>) -> Result<Source> {
         if let Some(every) = every_seconds {
             if !(MIN_TICKER_INTERVAL..=MAX_TICKER_INTERVAL).contains(&every) {
-                bail!("ticker interval must be {MIN_TICKER_INTERVAL}\u{2013}{MAX_TICKER_INTERVAL} seconds")
+                bail!(
+                    "ticker interval must be {MIN_TICKER_INTERVAL}\u{2013}{MAX_TICKER_INTERVAL} seconds"
+                )
             }
         }
         let c = self.conn()?;
@@ -1340,10 +1345,12 @@ fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FeedItem> {
     Ok(FeedItem {
         id: r.get(0)?,
         source: r.get(1)?,
-        // stored raw (it can be part of the identity key); cleaned for display
+        // Stored raw because it can be part of the identity key; clean terminal-bound fields.
         title: feed::title_text(&r.get::<_, String>(2)?),
         url: r.get::<_, Option<String>>(3)?.as_deref().and_then(link_url),
-        summary: r.get(4)?,
+        summary: r
+            .get::<_, Option<String>>(4)?
+            .map(|summary| feed::sanitize_terminal_text(&summary)),
         published_at: r.get(5)?,
         first_seen_at: r.get(6)?,
         enclosure_url: r.get::<_, Option<String>>(7)?.as_deref().and_then(link_url),
@@ -1361,16 +1368,35 @@ enum FetchOutcome {
     NotModified,
 }
 
-/// Where the catalog and artifacts live: `MG_BRIEF_DB` / `MG_BRIEF_ARTIFACT_ROOT`, else the
-/// XDG data and config folders. The CLI and every linked app (mg-feedr, mg-streamr) use this,
-/// so they always open the same catalog.
+// The one application-owned data directory, never a relative working-directory fallback
+fn application_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("/var/empty"))
+        .join("mg-brief")
+}
+
+/// Resolve an optional catalog override only under an existing, private parent directory.
+/// The parent check happens through no-follow descriptors before SQLite sees the pathname.
+pub fn database_path(candidate: Option<PathBuf>) -> Result<PathBuf> {
+    match candidate {
+        None => Ok(application_data_dir().join("catalog.sqlite")),
+        Some(path) => {
+            secure_db::validate_database_override(&path)
+                .context("catalog override must use an existing private directory")?;
+            Ok(path)
+        }
+    }
+}
+
+/// Where the default catalog and artifacts live. An explicit CLI override must have an existing,
+/// private, owner-only parent, so it cannot select a shared or attacker-controlled directory.
 pub fn default_paths() -> (PathBuf, PathBuf) {
-    let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let config = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let config = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/var/empty"));
     (
-        std::env::var_os("MG_BRIEF_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data.join("mg-brief/catalog.sqlite")),
+        application_data_dir().join("catalog.sqlite"),
         std::env::var_os("MG_BRIEF_ARTIFACT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| config.join("mg-brief/artifacts")),
@@ -1380,10 +1406,10 @@ pub fn default_paths() -> (PathBuf, PathBuf) {
 /// Download one http(s) file through the guarded network path, streaming it to `dest`.
 ///
 /// The same checks as feeds (no private or loopback targets, pinned DNS, no proxy, at most
-/// five redirects) plus a byte cap. It writes to a hidden `.<name>.part` beside `dest` and
-/// renames only once the whole file arrived under the cap, so a failed or cut-off download
-/// never leaves a half file under the real name. Returns the bytes written. For mg-streamr's
-/// podcast episodes and artwork.
+/// five redirects) plus a byte cap. It writes to a private, exclusively-created hidden part file
+/// beside `dest` and renames only once the whole file arrived under the cap, so a failed or
+/// cut-off download never leaves a half file under the real name. Returns the bytes written. For
+/// mg-streamr's podcast episodes and artwork.
 pub fn download_url(
     url: &str,
     user_agent: Option<&str>,
@@ -1406,31 +1432,92 @@ pub fn download_url(
         .file_name()
         .and_then(|n| n.to_str())
         .context("download destination needs a file name")?;
-    let part = dest.with_file_name(format!(".{name}.part"));
     let (r, _) = guarded_get(u, ua, timeout_secs, reqwest::header::HeaderMap::new())?;
     let mut r = r.error_for_status()?;
     if r.content_length().is_some_and(|n| n > max_bytes) {
         bail!("download exceeds configured maximum")
     }
-    let written = (|| -> Result<u64> {
-        let mut file = fs::File::create(&part)?;
+    let (mut file, mut part) = create_download_part(dest, name)?;
+    let write_result = (|| -> Result<u64> {
         let written = std::io::copy(&mut (&mut r).take(max_bytes + 1), &mut file)?;
         if written > max_bytes {
             bail!("download exceeds configured maximum")
         }
+        // Flush the file before publishing it under its destination name.
         file.sync_all()?;
         Ok(written)
     })();
-    match written {
-        Ok(n) => {
-            fs::rename(&part, dest)?;
-            Ok(n)
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&part);
-            Err(e)
+    drop(file);
+    let written = write_result?;
+    fs::rename(&part.path, dest)?;
+    part.disarm();
+    Ok(written)
+}
+
+#[derive(Debug)]
+struct DownloadPart {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl DownloadPart {
+    fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for DownloadPart {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+// Create a collision-safe private temporary file. Existing paths are never opened or replaced.
+fn create_download_part(dest: &Path, name: &str) -> Result<(File, DownloadPart)> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..MAX_DOWNLOAD_PART_ATTEMPTS {
+        let sequence = DOWNLOAD_PART_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = dest.with_file_name(format!(
+            ".{name}.{}.{}.{sequence}.part",
+            std::process::id(),
+            timestamp
+        ));
+        match create_download_part_file(&path) {
+            Ok(file) => {
+                return Ok((
+                    file,
+                    DownloadPart {
+                        path,
+                        cleanup: true,
+                    },
+                ));
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == ErrorKind::AlreadyExists) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("could not create a unique download temporary file")
+}
+
+// Atomically create one private part file without following an existing symlink.
+fn create_download_part_file(path: &Path) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).context("create download temporary file")
 }
 
 /// Fetch and parse any http(s) feed through the same guarded path as sources, storing nothing.
@@ -1705,8 +1792,7 @@ fn safe_diagnostic(message: &str) -> String {
 }
 
 // every query that builds a Source selects these, in this order
-const SOURCE_COLUMNS: &str =
-    "id,name,url,user_agent,enabled,ticker,fetch_interval_seconds,last_fetched_at,etag,last_modified";
+const SOURCE_COLUMNS: &str = "id,name,url,user_agent,enabled,ticker,fetch_interval_seconds,last_fetched_at,etag,last_modified";
 
 fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
     Ok(Source {
@@ -2157,25 +2243,97 @@ fn validate_network_target(u: &Url) -> Result<std::net::SocketAddr> {
         .context("source host has no allowed address")
 }
 
+// IPv4 ranges that are not globally routable. Keep this explicit rather than relying on a
+// partial collection of address helper methods: this is the SSRF authorization policy.
+const IPV4_NON_GLOBAL_CIDRS: [([u8; 4], u8); 17] = [
+    ([0, 0, 0, 0], 8),       // "this" network
+    ([10, 0, 0, 0], 8),      // RFC 1918
+    ([100, 64, 0, 0], 10),   // shared address space
+    ([127, 0, 0, 0], 8),     // loopback
+    ([169, 254, 0, 0], 16),  // link-local
+    ([172, 16, 0, 0], 12),   // RFC 1918
+    ([192, 0, 0, 0], 24),    // IETF protocol assignments
+    ([192, 0, 2, 0], 24),    // documentation
+    ([192, 31, 196, 0], 24), // AS112-v4
+    ([192, 88, 99, 0], 24),  // deprecated IPv6 relay anycast
+    ([192, 168, 0, 0], 16),  // RFC 1918
+    ([192, 175, 48, 0], 24), // direct delegation AS112 service
+    ([198, 18, 0, 0], 15),   // benchmarking
+    ([198, 51, 100, 0], 24), // documentation
+    ([203, 0, 113, 0], 24),  // documentation
+    ([224, 0, 0, 0], 4),     // multicast
+    ([240, 0, 0, 0], 4),     // reserved, including limited broadcast
+];
+
+// IPv6 ranges that are not ordinary global-unicast destinations. This is a deny policy for
+// SSRF protection: special-purpose blocks are denied even where an IANA record permits some
+// global forwarding, matching the IPv4 special-use policy above.
+const IPV6_NON_GLOBAL_CIDRS: [([u8; 16], u8); 14] = [
+    ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 128), // unspecified
+    ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 128), // loopback
+    ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], 96), // IPv4 mapped
+    (
+        [0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        96,
+    ), // NAT64
+    (
+        [0, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        48,
+    ), // local NAT64
+    ([0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 64), // discard only
+    ([0x01, 0x00, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 64), // dummy prefix
+    ([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 23), // IETF assignments
+    (
+        [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        32,
+    ), // documentation
+    ([0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16), // deprecated 6to4
+    ([0x3f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 20), // documentation
+    ([0x5f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16), // SRv6 SIDs
+    ([0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 7), // unique local
+    ([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 10), // link local
+];
+
 fn forbidden_ip(ip: IpAddr) -> bool {
+    !globally_routable_ip(ip)
+}
+
+fn globally_routable_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v) => {
-            v.is_loopback()
-                || v.is_private()
-                || v.is_link_local()
-                || v.is_multicast()
-                || v.is_unspecified()
-                || (v.octets()[0] == 169 && v.octets()[1] == 254)
-        }
+        IpAddr::V4(v) => !IPV4_NON_GLOBAL_CIDRS
+            .iter()
+            .any(|(network, prefix)| ipv4_in_cidr(v, *network, *prefix)),
         IpAddr::V6(v) => {
-            v.is_loopback()
-                || v.is_multicast()
-                || v.is_unspecified()
-                || v.is_unique_local()
-                || v.is_unicast_link_local()
-                || v.to_ipv4().is_some()
+            // IPv6 global-unicast space is 2000::/3. Everything outside it is non-routable,
+            // multicast, or reserved; listed special-use ranges inside it are denied below.
+            ipv6_in_cidr(v, [0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 3)
+                && !IPV6_NON_GLOBAL_CIDRS
+                    .iter()
+                    .any(|(network, prefix)| ipv6_in_cidr(v, *network, *prefix))
         }
     }
+}
+
+fn ipv4_in_cidr(ip: std::net::Ipv4Addr, network: [u8; 4], prefix: u8) -> bool {
+    let mask = match prefix {
+        0 => 0,
+        32 => u32::MAX,
+        _ => u32::MAX << (32 - u32::from(prefix)),
+    };
+    let address = u32::from_be_bytes(ip.octets());
+    let network = u32::from_be_bytes(network);
+    address & mask == network & mask
+}
+
+fn ipv6_in_cidr(ip: std::net::Ipv6Addr, network: [u8; 16], prefix: u8) -> bool {
+    let mask = match prefix {
+        0 => 0,
+        128 => u128::MAX,
+        _ => u128::MAX << (128 - u32::from(prefix)),
+    };
+    let address = u128::from_be_bytes(ip.octets());
+    let network = u128::from_be_bytes(network);
+    address & mask == network & mask
 }
 
 #[cfg(unix)]
@@ -2697,6 +2855,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_overrides_require_an_existing_private_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let allowed = directory.path().join("alternate.sqlite");
+        assert_eq!(database_path(Some(allowed.clone())).unwrap(), allowed);
+        assert!(database_path(Some(PathBuf::from("/tmp/catalog.sqlite"))).is_err());
+        assert!(database_path(Some(PathBuf::from("catalog.sqlite"))).is_err());
+    }
+
     // Put a test catalog back on the rollback journal. There a held read lock blocks the
     // commit — the only way to make a commit fail on purpose. WAL, the default since M5,
     // lets readers and a committing writer run together, so the failure would never happen
@@ -2763,7 +2936,10 @@ mod tests {
         fs::create_dir_all(&root)?;
         let feed = root.join("feed.xml");
         let mut f = fs::File::create(&feed)?;
-        writeln!(f, "<rss version=\"2.0\"><channel><title>T</title><link>https://example.test</link><description>D</description><item><title>Hello</title><link>https://example.test/a</link></item></channel></rss>")?;
+        writeln!(
+            f,
+            "<rss version=\"2.0\"><channel><title>T</title><link>https://example.test</link><description>D</description><item><title>Hello</title><link>https://example.test/a</link></item></channel></rss>"
+        )?;
         let s = Store::open_with_trusted_file_root(
             d.path().join("db.sqlite"),
             d.path().join("artifacts"),
@@ -2828,6 +3004,125 @@ mod tests {
             validate_network_target(&Url::parse("http://[::ffff:127.0.0.1]").unwrap()).is_err()
         );
         assert!(validate_network_target(&Url::parse("http://[fe80::1]").unwrap()).is_err());
+    }
+
+    #[test]
+    fn globally_routable_ipv6_policy_blocks_special_and_reserved_ranges() {
+        for blocked in [
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::c000:201",
+            "64:ff9b:1::c000:201",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:db8::1",
+            "2001:2::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "4000::1",
+        ] {
+            let address = blocked.parse().unwrap();
+            assert!(!globally_routable_ip(address), "{blocked} must be denied");
+        }
+        for allowed in ["2001:4860:4860::8888", "2606:4700:4700::1111"] {
+            let address = allowed.parse().unwrap();
+            assert!(
+                globally_routable_ip(address),
+                "{allowed} must remain allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn globally_routable_ipv4_policy_blocks_special_use_ranges() {
+        for blocked in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.88.99.1",
+            "192.168.0.1",
+            "192.175.48.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            let address = blocked.parse().unwrap();
+            assert!(!globally_routable_ip(address), "{blocked} must be denied");
+        }
+        for allowed in ["1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.1"] {
+            let address = allowed.parse().unwrap();
+            assert!(
+                globally_routable_ip(address),
+                "{allowed} must remain allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn download_part_creation_refuses_an_existing_part_without_clobbering_it() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let existing_part = directory.path().join(".episode.part");
+        fs::write(&existing_part, b"existing part")?;
+
+        assert!(create_download_part_file(&existing_part).is_err());
+        assert_eq!(fs::read(&existing_part)?, b"existing part");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_part_creation_refuses_symlinks_and_cleans_only_its_own_private_file() -> Result<()>
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir()?;
+        let sentinel = directory.path().join("sentinel");
+        let symlink_part = directory.path().join(".episode.part");
+        fs::write(&sentinel, b"do not overwrite")?;
+        symlink(&sentinel, &symlink_part)?;
+
+        assert!(create_download_part_file(&symlink_part).is_err());
+        assert_eq!(fs::read(&sentinel)?, b"do not overwrite");
+        assert!(fs::symlink_metadata(&symlink_part)?
+            .file_type()
+            .is_symlink());
+
+        let destination = directory.path().join("episode.mp3");
+        let (first_file, first_part) = create_download_part(&destination, "episode.mp3")?;
+        let first_path = first_part.path.clone();
+        let (second_file, second_part) = create_download_part(&destination, "episode.mp3")?;
+        let second_path = second_part.path.clone();
+        assert_ne!(first_path, second_path, "part names are collision-safe");
+        assert_eq!(fs::metadata(&first_path)?.permissions().mode() & 0o077, 0);
+
+        drop(first_file);
+        drop(second_file);
+        drop(first_part);
+        drop(second_part);
+        assert!(!first_path.exists() && !second_path.exists());
+        assert_eq!(fs::read(&sentinel)?, b"do not overwrite");
+        assert!(fs::symlink_metadata(&symlink_part)?
+            .file_type()
+            .is_symlink());
+        Ok(())
     }
 
     #[test]
@@ -3127,8 +3422,7 @@ mod tests {
             )
             .is_err());
 
-        let signed_locator =
-            "https://private.example.test/nvd.json?X-Amz-Credential=access&X-Amz-Signature=deadbeef";
+        let signed_locator = "https://private.example.test/nvd.json?X-Amz-Credential=access&X-Amz-Signature=deadbeef";
         let mut signed_record = record.clone();
         signed_record.provenance.references[0].locator = signed_locator.into();
         let mut signed_version = version.clone();

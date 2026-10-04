@@ -82,7 +82,7 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed> {
         .map(|image| image.uri.clone())
         .filter(|uri| !uri.trim().is_empty());
     Ok(ParsedFeed {
-        title: feed.title.map(|t| t.content),
+        title: feed.title.map(|t| sanitize_terminal_text(&t.content)),
         image_url,
         entries: feed.entries.into_iter().map(read_entry).collect(),
     })
@@ -170,7 +170,7 @@ fn read_entry(entry: Entry) -> ParsedEntry {
         url,
         title: entry
             .title
-            .map(|t| t.content)
+            .map(|t| sanitize_terminal_text(&t.content))
             .unwrap_or_else(|| UNTITLED.into()),
         summary,
         published: entry.published,
@@ -264,6 +264,7 @@ pub fn plain_text(html: &str, max: usize) -> String {
     }
     let decoded = decode_entities(&text);
     let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = sanitize_terminal_text(&collapsed);
     if collapsed.chars().count() <= max {
         return collapsed;
     }
@@ -280,6 +281,7 @@ pub fn title_text(raw: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    let collapsed = sanitize_terminal_text(&collapsed);
     if collapsed.chars().count() <= TITLE_MAX_CHARS {
         return collapsed;
     }
@@ -315,6 +317,30 @@ fn decode_entities(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Remove characters that can control a terminal while preserving ordinary Unicode text.
+///
+/// Feed content is rendered in terminal UIs after entity decoding, so this removes C0/C1
+/// controls (including ESC and BEL), DEL, and Unicode bidirectional formatting controls.
+pub fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !terminal_active_control(*c))
+        .collect()
+}
+
+// C0/C1 and DEL can start or terminate terminal sequences. The directional formatting controls
+// are invisible but can make a terminal display a different order than the stored text.
+fn terminal_active_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0000}'..='\u{001f}'
+            | '\u{007f}'..='\u{009f}'
+            | '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{206f}'
+    )
 }
 
 // One entity name or number → its character
@@ -480,6 +506,59 @@ mod tests {
         assert_eq!(
             title_text(&"x".repeat(400)).chars().count(),
             TITLE_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn terminal_output_text_removes_decoded_control_sequences_without_printing_them() {
+        let title = title_text("Top &#27;]52;c;YWJj&#7; story &#x1b;[2J");
+        let summary = plain_text(
+            "<p>Read &#27;]8;;https://evil.test&#7; this &#x1b;[31mnow</p>",
+            100,
+        );
+
+        assert_eq!(title, "Top ]52;c;YWJj story [2J");
+        assert_eq!(summary, "Read ]8;;https://evil.test this [31mnow");
+        assert!(
+            !title.chars().any(terminal_active_control)
+                && !summary.chars().any(terminal_active_control),
+            "sanitized output contains no active terminal control"
+        );
+        assert_eq!(
+            sanitize_terminal_text("left\u{7f}\u{009b}\u{202e}\u{2066}right"),
+            "leftright"
+        );
+    }
+
+    #[test]
+    fn parsed_feed_titles_and_summaries_are_terminal_safe() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel>
+<title>Feed &amp;#27;]52;c;YWJj&amp;#7;</title><item>
+<title>Entry &amp;#x1b;[2J</title><description>Summary &amp;#27;]8;;https://evil.test&amp;#7;</description>
+</item></channel></rss>"#;
+
+        let parsed = parse_feed(xml.as_bytes()).unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("Feed &#27;]52;c;YWJj&#7;"));
+        assert_eq!(parsed.entries[0].title, "Entry &#x1b;[2J");
+        assert_eq!(
+            parsed.entries[0].summary.as_deref(),
+            Some("Summary ]8;;https://evil.test")
+        );
+        assert_eq!(
+            title_text(parsed.title.as_deref().unwrap()),
+            "Feed ]52;c;YWJj"
+        );
+        assert_eq!(title_text(&parsed.entries[0].title), "Entry [2J");
+        assert!(
+            parsed
+                .title
+                .iter()
+                .chain(parsed.entries.iter().map(|entry| &entry.title))
+                .all(|text| !text.chars().any(terminal_active_control))
+                && parsed.entries[0]
+                    .summary
+                    .as_deref()
+                    .is_none_or(|text| !text.chars().any(terminal_active_control))
         );
     }
 

@@ -8,6 +8,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn run(db: &Path, artifacts: &Path, args: &[&str]) -> Output {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            db.parent().expect("catalog parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private catalog parent");
+    }
     Command::new(env!("CARGO_BIN_EXE_mg-brief"))
         .arg("--db")
         .arg(db)
@@ -63,8 +73,8 @@ fn ingest_document(artifact: &Path, revision: &str, version_id: &str, timestamp:
 #[test]
 fn status_is_read_only_and_reports_unconfigured_catalog() {
     let directory = tempfile::tempdir().unwrap();
-    let db = directory.path().join("missing/catalog.sqlite");
-    let artifact_root = directory.path().join("missing/artifacts");
+    let db = directory.path().join("catalog.sqlite");
+    let artifact_root = directory.path().join("artifacts");
     let output = run(&db, &artifact_root, &["status"]);
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();

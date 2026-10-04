@@ -1002,18 +1002,18 @@ impl CveStateTransition {
         }
         match &self.cause {
             TransitionCause::NewCve if self.from.is_some() => {
-                return Err(ValidationError::InvalidState("new_cve transition"))
+                return Err(ValidationError::InvalidState("new_cve transition"));
             }
             TransitionCause::CveWithdrawn if self.to != MatchStatus::Withdrawn => {
-                return Err(ValidationError::InvalidState("withdrawn transition"))
+                return Err(ValidationError::InvalidState("withdrawn transition"));
             }
             TransitionCause::CveWithdrawn if self.from == Some(MatchStatus::Withdrawn) => {
-                return Err(ValidationError::InvalidState("withdrawn transition"))
+                return Err(ValidationError::InvalidState("withdrawn transition"));
             }
             cause
                 if self.to == MatchStatus::Withdrawn && *cause != TransitionCause::CveWithdrawn =>
             {
-                return Err(ValidationError::InvalidState("withdrawn cause"))
+                return Err(ValidationError::InvalidState("withdrawn cause"));
             }
             _ => {}
         }

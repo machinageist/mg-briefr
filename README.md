@@ -9,7 +9,7 @@ asset observations. It explains and preserves provenance; it never performs reme
 The CLI uses SQLite for catalog state and a separate artifact root:
 
 ```text
-export MG_BRIEF_DB="$PWD/catalog.sqlite"
+export MG_BRIEF_DB="${XDG_DATA_HOME:-$HOME/.local/share}/mg-brief/catalog.sqlite"
 export MG_BRIEF_ARTIFACT_ROOT="$PWD/artifacts"
 
 cargo run -- register security-advisories https://example.invalid/feed.xml
@@ -17,6 +17,7 @@ cargo run -- sources
 cargo run -- fetch security-advisories --max-bytes 1048576 --timeout-seconds 20
 cargo run -- export --json > brief-snapshot.json
 cargo run -- status
+cargo run -- integrity --acknowledge-offline
 ```
 
 Network access is explicit in `fetch`. Requests are bounded by bytes and timeout, redirects
@@ -26,6 +27,29 @@ A failed fetch is a recorded failed run, not an implicit fallback.
 `status` is read-only: it opens the existing catalog without migrations or recovery and emits
 `mg.brief.status/1` with catalog counts. A missing or unreadable catalog is reported as an
 explicit unconfigured/unavailable state rather than creating files.
+
+`integrity --acknowledge-offline` copies the catalog and SQLite sidecars into a short-lived
+private snapshot, then runs SQLite's full `PRAGMA integrity_check` on that copy. It does not
+change the source database or its sidecars. It verifies `mg-feedr.service` is inactive and
+requires the operator to attest that other writers are stopped; findings are bounded in
+`mg.brief.integrity/1`.
+
+`recover --acknowledge-offline` snapshots the catalog and SQLite sidecars into a private
+recovery directory, then builds a separate `.recover` candidate. It never replaces the live
+catalog unless `--apply` is also passed and the candidate passes the application opener,
+integrity check, and exact typed-row digests for every readable application table. Digests are
+used only for comparison and are never emitted. The command verifies `mg-feedr.service` is
+inactive and requires the operator to acknowledge that any other writer is stopped. mg-streamr
+uses a separate position store. Before installation, the importer enforces SQLite page limits plus
+an inherited kernel file-size limit that recovered PRAGMAs cannot raise. Each file written by the
+importer is capped at 1 GiB; after import, the candidate database plus sidecars must also fit a
+combined 1 GiB bundle limit before integrity/application validation. After installation, mg-brief
+reopens the live catalog and repeats integrity/record checks. A failed read-back runs a staged
+database-plus-sidecar restore without overwriting unexpected paths; incomplete restore errors
+retain and name the original snapshot. The original snapshot is retained; this command requires
+`/usr/bin/sqlite3`, `/usr/bin/timeout`, and `/usr/bin/prlimit`, stream-bounds the source database
+plus sidecars and recovered SQL at 1 GiB each, and limits each SQLite CLI step to five minutes.
+It refuses installation if any baseline table cannot be read or differs.
 
 ### Ticker and items
 
